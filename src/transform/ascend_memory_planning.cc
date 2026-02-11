@@ -517,22 +517,24 @@ private:
           size_t allocated_offset;
           bool is_reused = false;
           
-          size_t new_memory_offset = alignUp(next_new_offset_, 32);
-          if (new_memory_offset + interval.size <= memory_limit_) {
-            allocated_offset = new_memory_offset;
-            next_new_offset_ = new_memory_offset + interval.size;
-            DLOG(DEBUG) << "  Allocated NEW memory at offset: " << allocated_offset;
+          // Try to reuse freed memory first (best-fit)
+          allocated_offset = findReusableBlock(interval.size, free_blocks);
+          if (allocated_offset != static_cast<size_t>(-1)) {
+            is_reused = true;
+            DLOG(DEBUG) << "  REUSED memory at offset: " << allocated_offset;
           } else {
-            allocated_offset = findReusableBlock(interval.size, free_blocks);
-            if (allocated_offset != static_cast<size_t>(-1)) {
-                is_reused = true;
-                DLOG(DEBUG) << "  REUSED memory at offset: " << allocated_offset;
+            // Fall back to allocating new memory
+            size_t new_memory_offset = alignUp(next_new_offset_, 32);
+            if (new_memory_offset + interval.size <= memory_limit_) {
+              allocated_offset = new_memory_offset;
+              next_new_offset_ = new_memory_offset + interval.size;
+              DLOG(DEBUG) << "  Allocated NEW memory at offset: " << allocated_offset;
             } else {
-                DLOG(ERROR) << "Memory allocation failed for: " 
-                            << interval.buffer->name_hint
-                            << " required: " << interval.size
-                            << ", new memory available: " << (memory_limit_ - next_new_offset_);
-                continue;
+              DLOG(ERROR) << "Memory allocation failed for: " 
+                          << interval.buffer->name_hint
+                          << " required: " << interval.size
+                          << ", new memory available: " << (memory_limit_ - next_new_offset_);
+              continue;
             }
           }
             
@@ -583,7 +585,10 @@ private:
       
       size_t findReusableBlock(size_t required_size, 
                                 std::vector<std::pair<size_t, size_t>>& free_blocks) {
-          
+        if (free_blocks.empty()) {
+          return static_cast<size_t>(-1);
+        }
+
         std::sort(free_blocks.begin(), free_blocks.end());
           
         for (const auto& block : free_blocks) {
@@ -610,7 +615,7 @@ private:
             }
           }
         }
-        return -1;
+        return static_cast<size_t>(-1);
       }
 
       void removeFromFreeBlocks(size_t offset, size_t size,
