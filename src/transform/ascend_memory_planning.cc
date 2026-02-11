@@ -599,22 +599,26 @@ private:
           size_t allocated_offset;
           bool is_reused = false;
           
-          size_t new_memory_offset = alignUp(next_new_offset_, 32);
-          if (new_memory_offset + interval.size <= memory_limit_) {
-            allocated_offset = new_memory_offset;
-            next_new_offset_ = new_memory_offset + interval.size;
-            DLOG(DEBUG) << "  Allocated NEW memory at offset: " << allocated_offset;
+          // Try to reuse freed memory first, then fall back to new allocation.
+          // This prevents exhausting the memory pool before expired intervals
+          // can be recycled — critical when total buffer sizes exceed the limit
+          // but peak live usage fits.
+          allocated_offset = findReusableBlock(interval.size, free_blocks);
+          if (allocated_offset != static_cast<size_t>(-1)) {
+            is_reused = true;
+            DLOG(DEBUG) << "  REUSED memory at offset: " << allocated_offset;
           } else {
-            allocated_offset = findReusableBlock(interval.size, free_blocks);
-            if (allocated_offset != static_cast<size_t>(-1)) {
-                is_reused = true;
-                DLOG(DEBUG) << "  REUSED memory at offset: " << allocated_offset;
+            size_t new_memory_offset = alignUp(next_new_offset_, 32);
+            if (new_memory_offset + interval.size <= memory_limit_) {
+              allocated_offset = new_memory_offset;
+              next_new_offset_ = new_memory_offset + interval.size;
+              DLOG(DEBUG) << "  Allocated NEW memory at offset: " << allocated_offset;
             } else {
-                DLOG(ERROR) << "Memory allocation failed for: " 
-                            << interval.buffer->name_hint
-                            << " required: " << interval.size
-                            << ", new memory available: " << (memory_limit_ - next_new_offset_);
-                continue;
+              DLOG(ERROR) << "Memory allocation failed for: " 
+                          << interval.buffer->name_hint
+                          << " required: " << interval.size
+                          << ", new memory available: " << (memory_limit_ - next_new_offset_);
+              continue;
             }
           }
             
