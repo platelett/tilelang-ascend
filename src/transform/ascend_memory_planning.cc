@@ -344,9 +344,12 @@ private:
       }
 
       // For each buffer with a kill at a deeper scope level than its gen,
-      // find the enclosing scope that contains the kill position and move
-      // the kill to that scope's end entry. This ensures buffer lifetimes
-      // extend to the end of enclosing loops/scopes.
+      // or inside a loop body, find the enclosing scope that contains the
+      // kill position and move the kill to that scope's end entry. This
+      // ensures buffer lifetimes extend to the end of enclosing loops/scopes.
+      // This is critical for loops: a buffer used inside a loop body must
+      // remain alive until the loop ends, since the body executes multiple
+      // times and the buffer may be needed in subsequent iterations.
       for (auto& event_pair : event_map_) {
         const Object* stmt = event_pair.first;
         EventEntry& event = event_pair.second;
@@ -371,36 +374,52 @@ private:
             }
           }
 
-          if (found_gen && kill_level > gen_level) {
+          // Find the kill statement's position in linear_seq_.
+          bool found_kill_pos = false;
+          size_t kill_seq_idx = 0;
+          auto range = stmt_positions.equal_range(stmt);
+          for (auto pos_it = range.first; pos_it != range.second; ++pos_it) {
+            size_t idx = pos_it->second;
+            if (linear_seq_[idx].scope_pair_offset <= 0) {
+              kill_seq_idx = idx;
+              found_kill_pos = true;
+              break;
+            }
+          }
+
+          // Check whether the kill is inside a loop (ForNode/WhileNode).
+          // Buffers killed inside a loop must have their kill extended to
+          // the loop end, because the loop body executes multiple times
+          // and the buffer may be needed in subsequent iterations.
+          bool kill_inside_loop = false;
+          if (found_kill_pos) {
+            for (size_t j = kill_seq_idx + 1; j != 0; --j) {
+              size_t idx = j - 1;
+              const StmtEntry& entry = linear_seq_[idx];
+              if (entry.scope_pair_offset > 0) {
+                size_t end_idx = idx + entry.scope_pair_offset;
+                if (end_idx >= kill_seq_idx) {
+                  if (IsLoopNode(entry.stmt)) {
+                    kill_inside_loop = true;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
+          bool should_reorder = found_gen && found_kill_pos &&
+                                (kill_level > gen_level || kill_inside_loop);
+
+          if (should_reorder) {
             // Remove kill from current position
             it = event.kill.erase(it);
 
-            // Find the kill statement's position in linear_seq_.
-            // For a leaf stmt it appears once. For a scope stmt, the kill
-            // would be on the scope-end entry (which has touched buffers).
-            // We look for an entry whose scope_pair_offset <= 0 (leaf or end).
-            bool found_kill_pos = false;
-            size_t kill_seq_idx = 0;
-            auto range = stmt_positions.equal_range(stmt);
-            for (auto pos_it = range.first; pos_it != range.second; ++pos_it) {
-              size_t idx = pos_it->second;
-              if (linear_seq_[idx].scope_pair_offset <= 0) {
-                kill_seq_idx = idx;
-                found_kill_pos = true;
-                break;
-              }
-            }
-
-            if (!found_kill_pos) {
-              // Should not happen, but skip this buffer if position not found
-              continue;
-            }
-
             // Walk backward through linear_seq_ from the kill position to
             // find enclosing scope-begin entries. We want the outermost
-            // enclosing scope with level > gen_level, so that the kill is
+            // enclosing scope with level >= gen_level (for loop-interior kills)
+            // or level > gen_level (for cross-level kills), so that the kill is
             // moved to that scope's end (covering the entire loop).
-            // Note: using j+1/j-1 pattern to safely iterate backward with size_t.
             const Object* target_scope_end_stmt = nullptr;
             for (size_t j = kill_seq_idx + 1; j != 0; --j) {
               size_t idx = j - 1;
@@ -413,10 +432,9 @@ private:
                   // Check the level of this scope entry
                   if (stmt_attrs_.count(entry.stmt)) {
                     int scope_level = static_cast<int>(stmt_attrs_.at(entry.stmt).level);
-                    if (scope_level > gen_level) {
-                      // This enclosing scope is deeper than gen_level.
-                      // Record its end entry as the target. Keep searching
-                      // outward — we want the outermost such scope.
+                    if (scope_level > gen_level ||
+                        (kill_inside_loop && scope_level >= gen_level &&
+                         IsLoopNode(entry.stmt))) {
                       target_scope_end_stmt = linear_seq_[end_idx].stmt;
                     }
                   }
@@ -727,6 +745,10 @@ private:
 
     static size_t AlignUp(size_t value, size_t alignment) {
       return ((value + alignment - 1) / alignment) * alignment;
+    }
+
+    static bool IsLoopNode(const Object* stmt) {
+      return stmt->IsInstance<ForNode>() || stmt->IsInstance<WhileNode>();
     }
 
     void UpdateStmtAttr(const Object* stmt, size_t level) {
