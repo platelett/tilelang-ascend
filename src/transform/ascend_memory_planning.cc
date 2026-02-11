@@ -399,8 +399,7 @@ private:
               if (entry.scope_pair_offset > 0) {
                 size_t end_idx = idx + entry.scope_pair_offset;
                 if (end_idx >= kill_seq_idx) {
-                  if (entry.stmt->IsInstance<ForNode>() ||
-                      entry.stmt->IsInstance<WhileNode>()) {
+                  if (IsLoopNode(entry.stmt)) {
                     kill_inside_loop = true;
                     break;
                   }
@@ -435,8 +434,7 @@ private:
                     int scope_level = static_cast<int>(stmt_attrs_.at(entry.stmt).level);
                     if (scope_level > gen_level ||
                         (kill_inside_loop && scope_level >= gen_level &&
-                         (entry.stmt->IsInstance<ForNode>() ||
-                          entry.stmt->IsInstance<WhileNode>()))) {
+                         IsLoopNode(entry.stmt))) {
                       target_scope_end_stmt = linear_seq_[end_idx].stmt;
                     }
                   }
@@ -747,6 +745,10 @@ private:
 
     static size_t AlignUp(size_t value, size_t alignment) {
       return ((value + alignment - 1) / alignment) * alignment;
+    }
+
+    static bool IsLoopNode(const Object* stmt) {
+      return stmt->IsInstance<ForNode>() || stmt->IsInstance<WhileNode>();
     }
 
     void UpdateStmtAttr(const Object* stmt, size_t level) {
