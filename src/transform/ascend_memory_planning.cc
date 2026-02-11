@@ -320,14 +320,21 @@ private:
     }
 
     void ReorderKillPoints() {
-      std::vector<StmtEntry> gen_kill_seq;
-      for (const auto& stmt_entry : linear_seq_) {
-        if (!event_map_[stmt_entry.stmt].gen.empty() ||
-            !event_map_[stmt_entry.stmt].kill.empty()) {
-          gen_kill_seq.push_back(stmt_entry);
-        }
+      // Build a mapping from stmt pointer to its position(s) in linear_seq_.
+      // For scope stmts, they appear twice: begin (scope_pair_offset > 0)
+      // and end (scope_pair_offset < 0). For leaf stmts, they appear once
+      // (scope_pair_offset == 0). We need the position where the kill event
+      // was recorded — that's found by matching the stmt pointer.
+      // We record ALL positions for each stmt to handle scope stmts correctly.
+      std::unordered_multimap<const Object*, size_t> stmt_positions;
+      for (size_t i = 0; i < linear_seq_.size(); ++i) {
+        stmt_positions.emplace(linear_seq_[i].stmt, i);
       }
 
+      // For each buffer with a kill at a deeper scope level than its gen,
+      // find the enclosing scope that contains the kill position and move
+      // the kill to that scope's end entry. This ensures buffer lifetimes
+      // extend to the end of enclosing loops/scopes.
       for (auto& event_pair : event_map_) {
         const Object* stmt = event_pair.first;
         EventEntry& event = event_pair.second;
@@ -337,13 +344,12 @@ private:
         ICHECK(stmt_attrs_.count(stmt));
         int kill_level = stmt_attrs_.at(stmt).level;
 
-        std::unordered_set<const VarNode*> visited_buffers;
-
         for (auto it = event.kill.begin(); it != event.kill.end();) {
           const VarNode* buffer = *it;
           bool found_gen = false;
           int gen_level = 0;
 
+          // Find the gen statement for this buffer
           for (const auto& gen_pair : event_map_) {
             const auto& gen_event = gen_pair.second;
             if (std::find(gen_event.gen.begin(), gen_event.gen.end(), buffer) != gen_event.gen.end()) {
@@ -354,33 +360,60 @@ private:
           }
 
           if (found_gen && kill_level > gen_level) {
-            if (visited_buffers.count(buffer)) {
-              ++it;
-              continue;
-            }
-            
+            // Remove kill from current position
             it = event.kill.erase(it);
 
-            const Object* last_stmt_at_level = nullptr;
-            auto stmt_it = gen_kill_seq.begin();
-            for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
-              if (stmt_it->stmt == stmt) {
+            // Find the kill statement's position in linear_seq_.
+            // For a leaf stmt it appears once. For a scope stmt, the kill
+            // would be on the scope-end entry (which has touched buffers).
+            // We look for an entry whose scope_pair_offset <= 0 (leaf or end).
+            bool found_kill_pos = false;
+            size_t kill_seq_idx = 0;
+            auto range = stmt_positions.equal_range(stmt);
+            for (auto pos_it = range.first; pos_it != range.second; ++pos_it) {
+              size_t idx = pos_it->second;
+              if (linear_seq_[idx].scope_pair_offset <= 0) {
+                kill_seq_idx = idx;
+                found_kill_pos = true;
                 break;
               }
             }
 
-            for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
-              auto next_it = stmt_it + 1;
-              if (next_it == gen_kill_seq.end() ||
-                  stmt_attrs_.at(next_it->stmt).level == gen_level) {
-                last_stmt_at_level = stmt_it->stmt;
-                break;
+            if (!found_kill_pos) {
+              // Should not happen, but skip this buffer if position not found
+              continue;
+            }
+
+            // Walk backward through linear_seq_ from the kill position to
+            // find enclosing scope-begin entries. We want the outermost
+            // enclosing scope with level > gen_level, so that the kill is
+            // moved to that scope's end (covering the entire loop).
+            // Note: using j+1/j-1 pattern to safely iterate backward with size_t.
+            const Object* target_scope_end_stmt = nullptr;
+            for (size_t j = kill_seq_idx + 1; j != 0; --j) {
+              size_t idx = j - 1;
+              const StmtEntry& entry = linear_seq_[idx];
+              // A scope-begin entry has scope_pair_offset > 0
+              if (entry.scope_pair_offset > 0) {
+                size_t end_idx = idx + entry.scope_pair_offset;
+                // Check that this scope actually contains the kill position
+                if (end_idx >= kill_seq_idx) {
+                  // Check the level of this scope entry
+                  if (stmt_attrs_.count(entry.stmt)) {
+                    int scope_level = static_cast<int>(stmt_attrs_.at(entry.stmt).level);
+                    if (scope_level > gen_level) {
+                      // This enclosing scope is deeper than gen_level.
+                      // Record its end entry as the target. Keep searching
+                      // outward — we want the outermost such scope.
+                      target_scope_end_stmt = linear_seq_[end_idx].stmt;
+                    }
+                  }
+                }
               }
             }
-            
-            if (last_stmt_at_level) {
-              event_map_[last_stmt_at_level].kill.push_back(buffer);
-              visited_buffers.insert(buffer);
+
+            if (target_scope_end_stmt) {
+              event_map_[target_scope_end_stmt].kill.push_back(buffer);
             }
           } else {
             ++it;
