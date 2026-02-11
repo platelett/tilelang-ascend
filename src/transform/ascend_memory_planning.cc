@@ -272,6 +272,7 @@ private:
     }
 
     void LivenessAnalysis() {
+      // find kill point, do a reverse linear scan.
       std::unordered_set<const VarNode*> touched;
       for (size_t i = linear_seq_.size(); i != 0; --i) {
         const StmtEntry& s = linear_seq_[i - 1];
@@ -283,10 +284,19 @@ private:
         }
       }
 
+      // find gen point, do forward scan
+      // Use scope_pair_offset to correctly handle scope boundaries:
+      // - offset < 0 means end of scope, skip
+      // - offset >= 0 means leaf stmt (0) or beginning of scope (>0)
+      //   For scope beginnings, look at the end entry (i + offset) to get touched buffers
+      touched.clear();
       for (size_t i = 0; i < linear_seq_.size(); ++i) {
-        const StmtEntry& s = linear_seq_[i];
+        int64_t offset = linear_seq_[i].scope_pair_offset;
+        if (offset < 0) continue;
+        const StmtEntry& s = linear_seq_[i + offset];
         for (const VarNode* buffer : s.touched) {
-          if (first_use_.count(buffer) && first_use_[buffer] == i) {
+          if (!touched.count(buffer)) {
+            touched.insert(buffer);
             event_map_[s.stmt].gen.push_back(buffer);
           }
         }
@@ -362,7 +372,7 @@ private:
             for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
               auto next_it = stmt_it + 1;
               if (next_it == gen_kill_seq.end() ||
-                  stmt_attrs_.at(next_it->stmt).level == gen_level - 1) {
+                  stmt_attrs_.at(next_it->stmt).level == gen_level) {
                 last_stmt_at_level = stmt_it->stmt;
                 break;
               }
@@ -382,40 +392,49 @@ private:
     void PlanMemoryForScope(const std::string& scope, const std::vector<const VarNode*>& buffers) {
       DLOG(DEBUG) << "Planning memory for scope: " << scope;
 
+      // Collect the set of buffers belonging to this scope for filtering
+      std::unordered_set<const VarNode*> scope_buffer_set(buffers.begin(), buffers.end());
+
+      // Build live intervals by walking linear_seq_ with scope_pair_offset
+      // to properly handle gen/kill events at scope boundaries.
+      // This mirrors the PlanMemory approach from merge_shared_memory_allocations.cc
+      // and ascend_storage_rewrite.cc.
+      std::unordered_map<const VarNode*, int64_t> gen_index;
+      std::unordered_map<const VarNode*, int64_t> kill_index;
+
+      for (size_t i = 0; i < linear_seq_.size(); ++i) {
+        auto it = event_map_.find(linear_seq_[i].stmt);
+        if (it == event_map_.end()) continue;
+
+        // scope_pair_offset >= 0 means leaf stmt (0) or beginning of scope (>0)
+        // Handle gen events here
+        if (linear_seq_[i].scope_pair_offset >= 0) {
+          for (const VarNode* var : it->second.gen) {
+            if (scope_buffer_set.count(var) && gen_index.find(var) == gen_index.end()) {
+              gen_index[var] = static_cast<int64_t>(i);
+            }
+          }
+        }
+
+        // scope_pair_offset <= 0 means leaf stmt (0) or end of scope (<0)
+        // Handle kill events here
+        if (linear_seq_[i].scope_pair_offset <= 0) {
+          for (const VarNode* var : it->second.kill) {
+            if (scope_buffer_set.count(var)) {
+              kill_index[var] = static_cast<int64_t>(i);
+            }
+          }
+        }
+      }
+
       std::vector<LiveInterval> intervals;
       for (const VarNode* buffer : buffers) {
-        int64_t start = -1;
-        int64_t end = -1;
-          
-        for (const auto& event_pair : event_map_) {
-          const EventEntry& event = event_pair.second;
-          auto it = std::find(event.gen.begin(), event.gen.end(), buffer);
-          if (it != event.gen.end()) {
-            for (size_t i = 0; i < linear_seq_.size(); ++i) {
-              if (linear_seq_[i].stmt == event_pair.first) {
-                start = static_cast<int64_t>(i);
-                break;
-              }
-            }
-            break;
-          }
-        }
-          
-        for (const auto& event_pair : event_map_) {
-          const EventEntry& event = event_pair.second;
-          auto it = std::find(event.kill.begin(), event.kill.end(), buffer);
-          if (it != event.kill.end()) {
-            for (size_t i = 0; i < linear_seq_.size(); ++i) {
-              if (linear_seq_[i].stmt == event_pair.first) {
-                end = static_cast<int64_t>(i);
-                break;
-              }
-            }
-            break;
-          }
-        }
-          
-        if (start != -1 && end != -1) {
+        auto gen_it = gen_index.find(buffer);
+        auto kill_it = kill_index.find(buffer);
+
+        if (gen_it != gen_index.end() && kill_it != kill_index.end()) {
+          int64_t start = gen_it->second;
+          int64_t end = kill_it->second;
           intervals.emplace_back(buffer, start, end, buffer_sizes_[buffer]);
           DLOG(DEBUG) << "Buffer " << buffer->name_hint << ": [" << start << ", " << end 
                       << "], size=" << buffer_sizes_[buffer];
