@@ -665,7 +665,10 @@ private:
       
       size_t findReusableBlock(size_t required_size, 
                                 std::vector<std::pair<size_t, size_t>>& free_blocks) {
-          
+        if (free_blocks.empty()) {
+          return static_cast<size_t>(-1);
+        }
+
         std::sort(free_blocks.begin(), free_blocks.end());
           
         for (const auto& block : free_blocks) {
@@ -692,7 +695,7 @@ private:
             }
           }
         }
-        return -1;
+        return static_cast<size_t>(-1);
       }
 
       void removeFromFreeBlocks(size_t offset, size_t size,
