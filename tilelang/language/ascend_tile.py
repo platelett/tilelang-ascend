@@ -1502,8 +1502,10 @@ def broadcast(dst: Union[Buffer, BufferRegion], src: Union[Buffer, BufferRegion]
     src_shape = _get_shape(src)
     dst_shape = _get_shape(dst)
 
-    # Squeeze leading singleton dimensions to handle scalar-indexed BufferRegion
-    # (e.g., r_factors[i, :, :] produces shape [1, M, K] which should be treated as [M, K])
+    # Compute effective shapes by squeezing leading singleton dimensions to handle
+    # scalar-indexed BufferRegion (e.g., r_factors[i, :, :] on a 3D buffer produces
+    # region shape [1, M, K] which should be treated as effective shape [M, K]).
+    # These effective shapes are used for axis inference and passed to the intrinsic call.
     while len(src_shape) > len(dst_shape) and src_shape[0] == 1:
         src_shape = src_shape[1:]
     while len(dst_shape) > len(src_shape) and dst_shape[0] == 1:
