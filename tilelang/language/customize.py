@@ -118,6 +118,7 @@ def _dtype(buf):
 
 
 def npu_gemm(A, B, C, init=False):
+    """NPU GEMM intrinsic. A, B, C can be 2D or higher-order (leading dims must be 1)."""
 
     def legalize_arguments(arg: Union[Buffer, Var]):
         """Convert let-bound variables to their corresponding buffers.
