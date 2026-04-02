@@ -27,7 +27,7 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clea
         tir.Call: Handle to the reduction operation
     """
     buffer = buffer.access_ptr("r")
-    out = out.access_ptr("w")
+    out = out.access_ptr("w" if clear else "rw")
     return tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.reduce"),

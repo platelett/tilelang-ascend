@@ -140,9 +140,9 @@ def sort(dst: Buffer, src: Buffer, tmp: Buffer, actual_num: PrimExpr):
         "handle",
         tir.op.Op.get("tl.ascend_sort"),
         f"Sort<{_dtype(dst)}>",
-        dst.access_ptr("w"),
-        src.access_ptr("r"),
-        tmp.access_ptr("w"),
+        dst.access_ptr("rw"),
+        src.access_ptr("rw"),
+        tmp.access_ptr("rw"),
         repeatTimes,
         actual_num,
     )
@@ -269,9 +269,9 @@ def topk(dst: Buffer, src: Buffer, tmp: Buffer, block_size: PrimExpr):
         "handle",
         tir.op.Op.get("tl.ascend_topk"),
         f"TopK<{_dtype(dst)}>",
-        dst.access_ptr("w"),
+        dst.access_ptr("rw"),
         src.access_ptr("r"),
-        tmp.access_ptr("r"),
+        tmp.access_ptr("w"),
         block_size,
     )
 
@@ -431,7 +431,7 @@ def select(
         else:
             raise ValueError(f"Unsupported argument type: {type(object)} for buffer {object}")
 
-    dst_ptr = retrieve_ptr(dst, "r")
+    dst_ptr = retrieve_ptr(dst, "w")
     src0_ptr = retrieve_ptr(src0, "r")
 
     sel_mask_ptr = selMask.access_ptr("r")
@@ -835,12 +835,13 @@ def scalar_op(
     src0: Buffer | BufferRegion,
     scalar_value: PrimExpr,
     op_tl: str,
+    dst_access: str = "w",
 ):
     if isinstance(dst, BufferRegion):
-        dst_ptr, dst_extent = _handle_buffer_region(dst, "w")
+        dst_ptr, dst_extent = _handle_buffer_region(dst, dst_access)
         size_2 = math.prod(dst_extent)
     else:
-        dst_ptr = dst.access_ptr("w")
+        dst_ptr = dst.access_ptr(dst_access)
         size_2 = math.prod(dst.shape)
 
     if isinstance(src0, BufferRegion):
@@ -886,7 +887,7 @@ def axpy(dst: Buffer | BufferRegion, src0: Buffer | BufferRegion, scalar_value: 
         src0: The source buffer X.
         scalar_value: The scalar alpha.
     """
-    return scalar_op(dst, src0, scalar_value, "axpy")
+    return scalar_op(dst, src0, scalar_value, "axpy", dst_access="rw")
 
 
 def bitwise_lshift(dst: Buffer | BufferRegion, src0: Buffer | BufferRegion, scalarValue: PrimExpr):  # noqa: F821
@@ -984,7 +985,7 @@ def bilinear_interpolation(
         dst_blk_stride,
         v_r_offset,
         v_repeat,
-        shared_tmp_buffer.access_ptr("r"),
+        shared_tmp_buffer.access_ptr("w"),
     )
 
 
@@ -1458,7 +1459,7 @@ def sin(dst: Buffer | BufferRegion, src: Buffer | BufferRegion, tmp: Buffer):  #
         tir.op.Op.get("tl.ascend_sin"),
         dst_ptr,
         src_ptr,
-        tmp.access_ptr("r"),
+        tmp.access_ptr("w"),
         size_0,
     )
 
@@ -1495,7 +1496,7 @@ def cos(dst: Buffer | BufferRegion, src: Buffer | BufferRegion, tmp: Buffer):  #
         tir.op.Op.get("tl.ascend_cos"),
         dst_ptr,
         src_ptr,
-        tmp.access_ptr("r"),
+        tmp.access_ptr("w"),
         size_0,
     )
 
@@ -1609,7 +1610,7 @@ def clamp_max(out: Buffer | BufferRegion, buffer: Buffer | BufferRegion, tmp: Bu
         f"ClampMax<{_dtype(buffer)}>",
         out_ptr,
         buffer_ptr,
-        tmp.access_ptr("r"),
+        tmp.access_ptr("w"),
         scalar_value,
         count,
     )
@@ -1645,7 +1646,7 @@ def clamp_min(out: Buffer | BufferRegion, buffer: Buffer | BufferRegion, tmp: Bu
         f"ClampMin<{_dtype(buffer)}>",
         out_ptr,
         buffer_ptr,
-        tmp.access_ptr("r"),
+        tmp.access_ptr("w"),
         scalar_value,
         count,
     )
@@ -1668,9 +1669,9 @@ def clamp(
         A TVM intrinsic call that performs the clamp operation.
     """
     if isinstance(out, BufferRegion):
-        out_ptr, _ = _handle_buffer_region(out, "w")
+        out_ptr, _ = _handle_buffer_region(out, "rw")
     else:
-        out_ptr = out.access_ptr("w")
+        out_ptr = out.access_ptr("rw")
 
     if isinstance(buffer, BufferRegion):
         buffer_ptr, _ = _handle_buffer_region(buffer, "r")
@@ -1683,7 +1684,7 @@ def clamp(
         f"Clamp<{_dtype(buffer)}>",
         out_ptr,
         buffer_ptr,
-        tmp.access_ptr("r"),
+        tmp.access_ptr("w"),
         min_scalar,
         max_scalar,
         count,
@@ -1701,7 +1702,7 @@ def round(out: Buffer | BufferRegion, buffer: Buffer | BufferRegion, tmp: Buffer
     else:
         buffer_ptr = buffer.access_ptr("r")
 
-    return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_round"), out_ptr, buffer_ptr, tmp.access_ptr("r"), count)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_round"), out_ptr, buffer_ptr, tmp.access_ptr("w"), count)
 
 
 def broadcast(
@@ -1752,9 +1753,9 @@ def broadcast(
         src_extent = src.shape
 
     if isinstance(tmp, BufferRegion):
-        tmp_ptr, _ = _handle_buffer_region(tmp, "r")
+        tmp_ptr, _ = _handle_buffer_region(tmp, "w")
     else:
-        tmp_ptr = tmp.access_ptr("r")
+        tmp_ptr = tmp.access_ptr("w")
 
     dtype = _dtype(src)
 
@@ -1878,7 +1879,7 @@ def reduce_sum_experiment(dst: Buffer, src: Buffer, sharedtmp: Buffer, count: Pr
         tir.op.Op.get("tl.ascend_reducesum_experiment"),
         dst.access_ptr("w"),
         src.access_ptr("r"),
-        sharedtmp.access_ptr("r"),
+        sharedtmp.access_ptr("w"),
         count,
     )
 
@@ -1900,7 +1901,7 @@ def reduce_sum_mask_experiment(dst: Buffer, src: Buffer, sharedtmp: Buffer, mask
         tir.op.Op.get("tl.ascend_reducesum_mask_experiment"),
         dst.access_ptr("w"),
         src.access_ptr("r"),
-        sharedtmp.access_ptr("r"),
+        sharedtmp.access_ptr("w"),
         mask,
         repeatTime,
         srcRepStride,

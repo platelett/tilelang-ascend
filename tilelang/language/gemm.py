@@ -115,7 +115,7 @@ def gemm(
 
     Aptr = retrieve_ptr(A, "r")
     Bptr = retrieve_ptr(B, "r")
-    Cptr = retrieve_ptr(C, "rw")
+    Cptr = retrieve_ptr(C, "w" if clear_accum else "rw")
     return tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.gemm"),

@@ -1193,7 +1193,11 @@ void CodeGenTileLangAscendPto::CopyL1ToL0Codegen(const CallNode *call,
 void CodeGenTileLangAscendPto::CallExternCodegen(const CallNode *op) {
   std::string op_name = Downcast<StringImm>(op->args[0])->value;
 
-  if (op_name.find("tl::ascend::copy_gm_to_ub") != std::string::npos) {
+  if (op_name.find("tl::ascend::copy_gm_to_ub_tail") != std::string::npos) {
+    GMCopyCall(op, "copy_gm_to_ub_tail");
+  } else if (op_name.find("tl::ascend::copy_ub_to_gm_tail") != std::string::npos) {
+    GMCopyCall(op, "copy_ub_to_gm_tail");
+  } else if (op_name.find("tl::ascend::copy_gm_to_ub") != std::string::npos) {
     GMCopyCall(op, "copy_gm_to_ub");
   } else if (op_name.find("tl::ascend::copy_ub_to_gm") != std::string::npos) {
     GMCopyCall(op, "copy_ub_to_gm");

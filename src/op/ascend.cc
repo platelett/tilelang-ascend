@@ -280,9 +280,12 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       2, dst_new_buffer->dtype, 1,
       dst_new_buffer.OffsetOf(dst_new_indices).back(), dst_len);
 
-  auto compute_valid_extent = [](PrimExpr min_val, PrimExpr extent,
-                                 PrimExpr shape) -> PrimExpr {
+  auto compute_valid_extent = [analyzer](PrimExpr min_val, PrimExpr extent,
+                                         PrimExpr shape) -> PrimExpr {
     PrimExpr remaining = shape - min_val;
+    if (analyzer->CanProve(remaining >= extent)) {
+      return extent;
+    }
     return Select(remaining >= extent, extent,
                   Select(remaining > 0, remaining, 0));
   };
@@ -399,8 +402,33 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     validCol_dst = 0;
   }
 
+  bool gm2ub_needs_tail = false;
+  bool ub2gm_needs_tail = false;
+  if (config.gm2ub) {
+    gm2ub_needs_tail =
+        validRow_src.as<SelectNode>() || validCol_src.as<SelectNode>();
+  }
+  if (config.ub2gm) {
+    ub2gm_needs_tail =
+        validRow_dst.as<SelectNode>() || validCol_dst.as<SelectNode>();
+  }
+
+  std::string op_str = ss.str();
+  if (config.gm2ub && gm2ub_needs_tail) {
+    size_t pos = op_str.find("copy_gm_to_ub");
+    if (pos != std::string::npos) {
+      op_str.replace(pos, 13, "copy_gm_to_ub_tail");
+    }
+  }
+  if (config.ub2gm && ub2gm_needs_tail) {
+    size_t pos = op_str.find("copy_ub_to_gm");
+    if (pos != std::string::npos) {
+      op_str.replace(pos, 13, "copy_ub_to_gm_tail");
+    }
+  }
+
   Array<PrimExpr> new_args;
-  new_args.push_back(StringImm(ss.str()));
+  new_args.push_back(StringImm(op_str));
   new_args.push_back(src_ptr);
   new_args.push_back(dst_ptr);
 
@@ -431,13 +459,15 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 
   if (config.gm2ub) {
-    new_args.push_back(validRow_src);
-    new_args.push_back(validCol_src);
-    PrimExpr pad_val = padValue;
-    if (pad_val->dtype != dst->dtype) {
-      pad_val = Cast(dst->dtype, pad_val);
+    if (gm2ub_needs_tail) {
+      new_args.push_back(validRow_src);
+      new_args.push_back(validCol_src);
+      PrimExpr pad_val = padValue;
+      if (pad_val->dtype != dst->dtype) {
+        pad_val = Cast(dst->dtype, pad_val);
+      }
+      new_args.push_back(pad_val);
     }
-    new_args.push_back(pad_val);
     if (dst->shape.size() > 1) {
       new_args.push_back(dst->shape[dst->shape.size() - 2]);
     }
@@ -445,8 +475,10 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 
   if (config.ub2gm) {
-    new_args.push_back(validRow_dst);
-    new_args.push_back(validCol_dst);
+    if (ub2gm_needs_tail) {
+      new_args.push_back(validRow_dst);
+      new_args.push_back(validCol_dst);
+    }
     if (src->shape.size() > 1) {
       new_args.push_back(src->shape[src->shape.size() - 2]);
     }

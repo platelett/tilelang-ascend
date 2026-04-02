@@ -174,11 +174,23 @@ CATLASS_DEVICE auto thread_block_swizzle(uint64_t pid) {
   return coord.m() * cols + coord.n();
 }
 
+// Fast path: all DMA params are compile-time constants, no sync needed.
+template <typename T, uint32_t dstN, uint32_t dstM = 1>
+CATLASS_DEVICE void copy_gm_to_ub(LocalTensor<T> dstTensor,
+                                  GlobalTensor<T> srcTensor,
+                                  uint32_t realSrcN = 1) {
+  AscendC::DataCopyExtParams dataCopyParams(
+      dstM, dstN * sizeof(T), (realSrcN - dstN) * sizeof(T), 0, 0);
+  AscendC::DataCopyPadExtParams<T> padParams(false, 0, 0, 0);
+  AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams, padParams);
+}
+
+// Tail path: runtime-variable mask shape with padding and sync.
 template <typename T, uint32_t dstN, uint32_t dstM = 1>
 CATLASS_DEVICE void
-copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
-              uint32_t realSrcN = 1, uint32_t maskShapeM = dstM,
-              uint32_t maskShapeN = dstN, T padValue = T(0)) {
+copy_gm_to_ub_tail(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
+                   uint32_t realSrcN = 1, uint32_t maskShapeM = dstM,
+                   uint32_t maskShapeN = dstN, T padValue = T(0)) {
 
   bool isPad = true;
   uint32_t rightPadding = 1;
@@ -200,11 +212,22 @@ copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
   AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams, padParams);
 }
 
+// Fast path: all DMA params are compile-time constants.
+template <typename T, uint32_t srcN, uint32_t srcM = 1>
+CATLASS_DEVICE void copy_ub_to_gm(GlobalTensor<T> dstTensor,
+                                  LocalTensor<T> srcTensor,
+                                  uint32_t realdstN = 1) {
+  AscendC::DataCopyExtParams dataCopyParams(srcM, srcN * sizeof(T), 0,
+                                            (realdstN - srcN) * sizeof(T), 0);
+  AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams);
+}
+
+// Tail path: runtime-variable mask shape.
 template <typename T, uint32_t srcN, uint32_t srcM = 1>
 CATLASS_DEVICE void
-copy_ub_to_gm(GlobalTensor<T> dstTensor, LocalTensor<T> srcTensor,
-              uint32_t realdstN = 1, uint32_t maskShapeM = srcM,
-              uint32_t maskShapeN = srcN) {
+copy_ub_to_gm_tail(GlobalTensor<T> dstTensor, LocalTensor<T> srcTensor,
+                   uint32_t realdstN = 1, uint32_t maskShapeM = srcM,
+                   uint32_t maskShapeN = srcN) {
   AscendC::DataCopyExtParams dataCopyParams(
       maskShapeM, maskShapeN * sizeof(T), (srcN - maskShapeN) * sizeof(T) / 32,
       (realdstN - maskShapeN) * sizeof(T), 0);

@@ -534,9 +534,9 @@ def reduce(
         out_ptr = out.access_ptr("w")
 
     if isinstance(tmp, BufferRegion):
-        tmp_ptr, _ = _handle_buffer_region(tmp, "r")
+        tmp_ptr, _ = _handle_buffer_region(tmp, "w")
     else:
-        tmp_ptr = tmp.access_ptr("r")
+        tmp_ptr = tmp.access_ptr("w")
 
     if len(buffer_extent) == 2:
         M = buffer_extent[0] if real_shape[0] == 0 else real_shape[0]

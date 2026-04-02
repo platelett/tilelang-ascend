@@ -2170,9 +2170,13 @@ void CodeGenTileLangAscend::CopyCodegen(const CallNode *op) {
   auto src_type = GetAccessPtrDtype(op->args[1].as<CallNode>());
   auto dst_type = GetAccessPtrDtype(op->args[2].as<CallNode>());
 
-  static const std::unordered_map<std::string, int> kCopyOpExtraArgs = {
-      {"copy_l0c_to_gm", 3}, {"copy_gm_to_l1", 3}, {"copy_l1_to_l0a", 2},
-      {"copy_l1_to_l0b", 2}, {"copy_gm_to_ub", 4}, {"copy_ub_to_gm", 3},
+  // Use vector<pair> with longer (tail) names first so that find()
+  // matches them before the shorter base names.
+  static const std::vector<std::pair<std::string, int>> kCopyOpExtraArgs = {
+      {"copy_gm_to_ub_tail", 4}, {"copy_ub_to_gm_tail", 3},
+      {"copy_l0c_to_gm", 3},    {"copy_gm_to_l1", 3},
+      {"copy_l1_to_l0a", 2},    {"copy_l1_to_l0b", 2},
+      {"copy_gm_to_ub", 1},     {"copy_ub_to_gm", 1},
       {"copy_ub_to_ub", 0}};
 
   bool found = false;
