@@ -295,6 +295,15 @@ const Op &ascend_binary_op();
 
 const Op &ascend_binary_ops();
 
+/*!
+ * \brief TileLang-specific access pointer intrinsic with pipeline metadata.
+ *
+ * tl_access_ptr(type, data, offset, extent, rw_mask, pipeline)
+ *
+ * Replaces tvm_access_ptr after RewriteAccessPtr pass.
+ */
+const Op &tl_access_ptr();
+
 } // namespace tl
 } // namespace tvm
 

@@ -1999,11 +1999,11 @@ void CodeGenTileLangAscend::PrintfOpCodegen(const CallNode *op,
       this->stream << ", ";
     }
     if (auto *arg = op->args[i].as<CallNode>()) {
-      if (arg->op.same_as(builtin::tvm_access_ptr())) {
+      if (arg->op.same_as(tl::tl_access_ptr())) {
         this->stream << PrintBufferOffset(arg, false) << ".GetPhyAddr()";
       } else {
         std::cout
-            << "CallNode with builtin::tvm_access_ptr is requested, but got "
+            << "CallNode with tl::tl_access_ptr is requested, but got "
             << op->args[i] << ".\n";
       }
     } else {

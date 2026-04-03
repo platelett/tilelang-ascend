@@ -29,6 +29,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include "../op/builtin.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 
@@ -75,7 +76,7 @@ public:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
+    if (op->op.same_as(tl::tl_access_ptr())) {
       return MakeAccessPtr(op);
     } else {
       return StmtExprMutator::VisitExpr_(op);

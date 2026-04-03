@@ -215,7 +215,7 @@ void CodeGenTileLangAscendPto::CreateCubeVariable(
 
 ShapeInfo CodeGenTileLangAscendPto::GetSliceInfo(const CallNode *op) {
   ICHECK(op);
-  ICHECK(op->op.same_as(builtin::tvm_access_ptr()));
+  ICHECK(op->op.same_as(tl::tl_access_ptr()));
 
   Var buffer_var = Downcast<Var>(op->args[1]);
 
@@ -1497,7 +1497,7 @@ void CodeGenTileLangAscendPto::MergeSortCodegen(const CallNode *op,
   // Get dst buffer info using GetSliceInfo (like other codegen functions)
   auto dst_call = op->args[2].as<CallNode>();
   ICHECK(dst_call != nullptr) << "MergeSort args[2] (dst) is not a CallNode";
-  ICHECK(dst_call->op.same_as(builtin::tvm_access_ptr()))
+  ICHECK(dst_call->op.same_as(tl::tl_access_ptr()))
       << "MergeSort args[2] (dst) is not a tvm_access_ptr";
   ShapeInfo dst_shape_info = GetSliceInfo(dst_call);
   std::string dst_name = dst_shape_info.ub_name;
@@ -1511,7 +1511,7 @@ void CodeGenTileLangAscendPto::MergeSortCodegen(const CallNode *op,
   // Get tmp buffer info
   auto tmp_call = op->args[3].as<CallNode>();
   ICHECK(tmp_call != nullptr) << "MergeSort args[3] (tmp) is not a CallNode";
-  ICHECK(tmp_call->op.same_as(builtin::tvm_access_ptr()))
+  ICHECK(tmp_call->op.same_as(tl::tl_access_ptr()))
       << "MergeSort args[3] (tmp) is not a tvm_access_ptr";
   ShapeInfo tmp_shape_info = GetSliceInfo(tmp_call);
   std::string tmp_name = tmp_shape_info.ub_name;
@@ -1528,7 +1528,7 @@ void CodeGenTileLangAscendPto::MergeSortCodegen(const CallNode *op,
     ICHECK(src_call != nullptr)
         << "MergeSort args[" << (4 + i) << "] (src" << i
         << ") is not a CallNode, arg type: " << op->args[4 + i]->GetTypeKey();
-    ICHECK(src_call->op.same_as(builtin::tvm_access_ptr()))
+    ICHECK(src_call->op.same_as(tl::tl_access_ptr()))
         << "MergeSort args[" << (4 + i) << "] (src" << i
         << ") is not a tvm_access_ptr";
     ShapeInfo src_shape_info = GetSliceInfo(src_call);

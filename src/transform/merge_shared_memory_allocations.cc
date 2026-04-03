@@ -462,7 +462,7 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
+    if (op->op.same_as(tl::tl_access_ptr())) {
       ICHECK_GE(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
       Var buffer = Downcast<Var>(op->args[1]);

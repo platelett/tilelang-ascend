@@ -168,6 +168,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_binary_ops)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(tl_access_ptr)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 
 } // namespace tl
 } // namespace tvm

@@ -31,6 +31,7 @@
 #include <unordered_set>
 
 #include "./storage_access.h"
+#include "../op/builtin.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 
@@ -423,7 +424,7 @@ public:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
+    if (op->op.same_as(tl::tl_access_ptr())) {
       PrimExpr expr = StmtExprMutator::VisitExpr_(op);
       op = expr.as<CallNode>();
       ICHECK_GE(op->args.size(), 5U);

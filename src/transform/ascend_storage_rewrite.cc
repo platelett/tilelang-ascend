@@ -513,7 +513,7 @@ public:
     }
   }
   PrimExpr VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
+    if (op->op.same_as(tl::tl_access_ptr())) {
       ICHECK_GE(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
       const VarNode *buffer = op->args[1].as<VarNode>();
@@ -1322,7 +1322,7 @@ public:
   }
 
   void VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
+    if (op->op.same_as(tl::tl_access_ptr())) {
       DataType dtype = op->args[0].dtype();
       const VarNode *buffer = op->args[1].as<VarNode>();
       PrimExpr index = op->args[2];
@@ -1736,7 +1736,7 @@ public:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
+    if (op->op.same_as(tl::tl_access_ptr())) {
       PrimExpr expr = StmtExprMutator::VisitExpr_(op);
       op = expr.as<CallNode>();
 
@@ -1764,7 +1764,7 @@ public:
       for (size_t i = 5; i < op->args.size(); ++i) {
         acc_args.push_back(op->args[i]);
       }
-      return Call(info.new_element_dtype, builtin::tvm_access_ptr(), acc_args);
+      return Call(info.new_element_dtype, tl::tl_access_ptr(), acc_args);
 
     } else {
       return StmtExprMutator::VisitExpr_(op);

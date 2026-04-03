@@ -28,6 +28,7 @@
 #include <string>
 #include <utility>
 
+#include "../op/builtin.h"
 #include "tir/transforms/ir_utils.h"
 
 namespace tvm {
@@ -271,7 +272,7 @@ void TileLangStorageAccessVisitor::VisitExpr_(const CallNode *op) {
     } else {
       StmtExprVisitor::VisitExpr_(op);
     }
-  } else if (op->op.same_as(builtin::tvm_access_ptr())) {
+  } else if (op->op.same_as(tl::tl_access_ptr())) {
     ICHECK_GE(op->args.size(), 5U);
     DataType dtype = op->args[0].dtype();
     const VarNode *buffer = op->args[1].as<VarNode>();

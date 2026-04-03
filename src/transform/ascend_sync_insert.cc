@@ -1006,7 +1006,7 @@ private:
   class ExprAccessAnalyzer : public ExprVisitor {
   public:
     void VisitExpr_(const CallNode *op) override {
-      if (op->op.same_as(builtin::tvm_access_ptr())) {
+      if (op->op.same_as(tl::tl_access_ptr())) {
         if (op->args.size() >= 5) {
           if (auto var = op->args[1].as<VarNode>()) {
             std::string buffer_name = var->name_hint;
@@ -1123,7 +1123,7 @@ private:
                   bool is_ir_pipeline_override = false;
                   if (auto access_call =
                           call->args[arg_index + 1].as<CallNode>()) {
-                    if (access_call->op.same_as(builtin::tvm_access_ptr()) &&
+                    if (access_call->op.same_as(tl::tl_access_ptr()) &&
                         access_call->args.size() > 5) {
                       if (auto pipeline_imm =
                               access_call->args[5].as<IntImmNode>()) {
@@ -1200,7 +1200,7 @@ private:
                     std::string pipeline_str = config.default_pipeline;
                     bool is_ir_pipeline_override = false;
                     if (auto access_call = call->args[arg_index].as<CallNode>()) {
-                      if (access_call->op.same_as(builtin::tvm_access_ptr()) &&
+                      if (access_call->op.same_as(tl::tl_access_ptr()) &&
                           access_call->args.size() > 5) {
                         if (auto pipeline_imm =
                                 access_call->args[5].as<IntImmNode>()) {
@@ -1279,7 +1279,7 @@ private:
     BufferInfo info = {"", false, false};
 
     if (auto call = expr.as<CallNode>()) {
-      if (call->op.same_as(builtin::tvm_access_ptr())) {
+      if (call->op.same_as(tl::tl_access_ptr())) {
         if (call->args.size() >= 5) {
           if (auto var = call->args[1].as<VarNode>()) {
             info.buffer_name = var->name_hint;

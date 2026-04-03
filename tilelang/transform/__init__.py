@@ -279,6 +279,20 @@ def VectorizeLoop(enable_vectorize: bool = True):
     return _ffi_api.VectorizeLoop(enable_vectorize)  # type: ignore
 
 
+def RewriteAccessPtr():
+    """Rewrite tvm_access_ptr to tl_access_ptr.
+
+    Replaces all tvm_access_ptr intrinsic calls with tl_access_ptr
+    in the IR. Must run before passes that expect tl_access_ptr.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.RewriteAccessPtr()  # type: ignore
+
+
 def InjectPTXAsyncCopy():
     """Rewrite global to shared memory copy on CUDA with asynchronous copy.
 

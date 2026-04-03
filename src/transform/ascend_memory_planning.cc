@@ -229,7 +229,7 @@ private:
     void VisitExpr_(const VarNode *buf) final { TrackBufferTouch(buf); }
 
     void VisitExpr_(const CallNode *op) final {
-      if (op->op.same_as(builtin::tvm_access_ptr())) {
+      if (op->op.same_as(tl::tl_access_ptr())) {
         Var buffer = Downcast<Var>(op->args[1]);
         if (IsNPUSharedMemory(buffer)) {
           TrackBufferTouch(buffer.get());
