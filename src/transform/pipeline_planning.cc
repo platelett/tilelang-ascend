@@ -176,7 +176,6 @@ private:
         const auto& config = config_it->second;
         for (const auto& buffer_config: config.buffer_accesses) {
           size_t arg_index = buffer_config.first;
-          const std::string& access_type = buffer_config.second;
           if (const auto* access_ptr = op->args[arg_index + 1].as<CallNode>()) {
             if (access_ptr->op.same_as(builtin::tvm_access_ptr())) {
               const VarNode* buffer_var = access_ptr->args[1].as<VarNode>();
@@ -185,12 +184,21 @@ private:
                 if (it != buffer_data_to_buffer_.end()) {
                   const Buffer& buffer = (*it).second;
                   const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
-                  if (access_type == "read") {
+                  int rw_mask = 0;
+                  if (access_ptr->args.size() > 4) {
+                    if (auto* imm = access_ptr->args[4].as<IntImmNode>()) {
+                      rw_mask = imm->value;
+                    }
+                  }
+                  bool is_read = (rw_mask & 1) != 0;
+                  bool is_write = (rw_mask & 2) != 0;
+                  if (is_read) {
                     reads_.push_back(buffer_region);
                     if (buffer.scope() == "global") {
                       is_global_read_ = true;
                     }
-                  } else if (access_type == "write") {
+                  }
+                  if (is_write) {
                     writes_.push_back(buffer_region);
                     if (is_global_read_ && (buffer.scope() == "shared" ||
                         buffer.scope() == "shared.dyn")) {
@@ -210,7 +218,6 @@ private:
       const auto& config = config_it->second;
       for (const auto& buffer_config: config.buffer_accesses) {
         size_t arg_index = buffer_config.first;
-        const std::string& access_type = buffer_config.second;
         if (const auto* access_ptr = op->args[arg_index].as<CallNode>()) {
           if (access_ptr->op.same_as(builtin::tvm_access_ptr())) {
             const VarNode* buffer_var = access_ptr->args[1].as<VarNode>();
@@ -219,12 +226,21 @@ private:
               if (it != buffer_data_to_buffer_.end()) {
                 const Buffer& buffer = (*it).second;
                 const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
-                if (access_type == "read") {
+                int rw_mask = 0;
+                if (access_ptr->args.size() > 4) {
+                  if (auto* imm = access_ptr->args[4].as<IntImmNode>()) {
+                    rw_mask = imm->value;
+                  }
+                }
+                bool is_read = (rw_mask & 1) != 0;
+                bool is_write = (rw_mask & 2) != 0;
+                if (is_read) {
                   reads_.push_back(buffer_region);
                   if (buffer.scope() == "global") {
                     is_global_read_ = true;
                   }
-                } else if (access_type == "write") {
+                }
+                if (is_write) {
                   writes_.push_back(buffer_region);
                   if (is_global_read_ && (buffer.scope() == "shared" ||
                       buffer.scope() == "shared.dyn")) {
@@ -236,7 +252,6 @@ private:
           }
         }
       }
-
     } else {
 
       StmtExprVisitor::VisitExpr_(op);

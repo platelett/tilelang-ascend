@@ -272,7 +272,7 @@ void TileLangStorageAccessVisitor::VisitExpr_(const CallNode *op) {
       StmtExprVisitor::VisitExpr_(op);
     }
   } else if (op->op.same_as(builtin::tvm_access_ptr())) {
-    ICHECK_EQ(op->args.size(), 5U);
+    ICHECK_GE(op->args.size(), 5U);
     DataType dtype = op->args[0].dtype();
     const VarNode *buffer = op->args[1].as<VarNode>();
     PrimExpr offset = op->args[2];

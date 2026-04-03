@@ -34,6 +34,7 @@
 #include "../op/builtin.h"
 #include "./common/collector.h"
 #include "./common/operation_config.h"
+#include "./common/pipeline_types.h"
 
 namespace tvm {
 namespace tl {
@@ -1111,13 +1112,36 @@ private:
 
             for (const auto &buffer_config : config.buffer_accesses) {
               size_t arg_index = buffer_config.first;
-              const std::string &access_type = buffer_config.second;
 
               if (arg_index + 1 < call->args.size()) {
                 auto buffer_info =
                     ExtractBufferInfoFromAccessPtr(call->args[arg_index + 1]);
                 if (!buffer_info.buffer_name.empty()) {
-                  bool is_write = (access_type == "write");
+                  bool is_write = buffer_info.is_write;
+
+                  std::string pipeline_str = config.default_pipeline;
+                  bool is_ir_pipeline_override = false;
+                  if (auto access_call =
+                          call->args[arg_index + 1].as<CallNode>()) {
+                    if (access_call->op.same_as(builtin::tvm_access_ptr()) &&
+                        access_call->args.size() > 5) {
+                      if (auto pipeline_imm =
+                              access_call->args[5].as<IntImmNode>()) {
+                        int pipeline_int = pipeline_imm->value;
+                        if (pipeline_int != kPipelineUnset) {
+                          ICHECK(IsValidPipelineValue(pipeline_int))
+                              << "Invalid pipeline value: " << pipeline_int;
+                          pipeline_str = PipelineTypeToString(pipeline_int);
+                          is_ir_pipeline_override = true;
+                        }
+                      }
+                    }
+                  }
+
+                  if (is_ir_pipeline_override) {
+                    VLOG(1) << "Using IR pipeline override " << pipeline_str
+                            << " for buffer " << buffer_info.buffer_name;
+                  }
 
                   if (buffer_access_map.find(buffer_info.buffer_name) !=
                       buffer_access_map.end()) {
@@ -1137,7 +1161,7 @@ private:
 
                     access.buffer_name = buffer_info.buffer_name;
                     access.is_write = is_write;
-                    access.pipeline = config.default_pipeline;
+                    access.pipeline = pipeline_str;
                     access.operation = normalized_name;
                     access.is_sliced = buffer_info.is_sliced;
 
@@ -1166,13 +1190,35 @@ private:
 
               for (const auto &buffer_config : config.buffer_accesses) {
                 size_t arg_index = buffer_config.first;
-                const std::string &access_type = buffer_config.second;
 
                 if (arg_index < call->args.size()) {
                   auto buffer_info =
                       ExtractBufferInfoFromAccessPtr(call->args[arg_index]);
                   if (!buffer_info.buffer_name.empty()) {
-                    bool is_write = (access_type == "write");
+                    bool is_write = buffer_info.is_write;
+
+                    std::string pipeline_str = config.default_pipeline;
+                    bool is_ir_pipeline_override = false;
+                    if (auto access_call = call->args[arg_index].as<CallNode>()) {
+                      if (access_call->op.same_as(builtin::tvm_access_ptr()) &&
+                          access_call->args.size() > 5) {
+                        if (auto pipeline_imm =
+                                access_call->args[5].as<IntImmNode>()) {
+                          int pipeline_int = pipeline_imm->value;
+                          if (pipeline_int != kPipelineUnset) {
+                            ICHECK(IsValidPipelineValue(pipeline_int))
+                                << "Invalid pipeline value: " << pipeline_int;
+                            pipeline_str = PipelineTypeToString(pipeline_int);
+                            is_ir_pipeline_override = true;
+                          }
+                        }
+                      }
+                    }
+
+                    if (is_ir_pipeline_override) {
+                      VLOG(1) << "Using IR pipeline override " << pipeline_str
+                              << " for buffer " << buffer_info.buffer_name;
+                    }
 
                     if (buffer_access_map.find(buffer_info.buffer_name) !=
                         buffer_access_map.end()) {
@@ -1192,7 +1238,7 @@ private:
 
                       access.buffer_name = buffer_info.buffer_name;
                       access.is_write = is_write;
-                      access.pipeline = config.default_pipeline;
+                      access.pipeline = pipeline_str;
                       access.operation = normalized_name;
                       access.is_sliced = buffer_info.is_sliced;
 

@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "pipeline_types.h"
+
 namespace tvm {
 namespace tl {
 

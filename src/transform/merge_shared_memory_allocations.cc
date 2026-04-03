@@ -463,7 +463,7 @@ private:
 
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(builtin::tvm_access_ptr())) {
-      ICHECK_EQ(op->args.size(), 5U);
+      ICHECK_GE(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
       Var buffer = Downcast<Var>(op->args[1]);
       if (!IsAppropriateSharedMemory(buffer)) {
@@ -473,11 +473,13 @@ private:
 
       PrimExpr offset = this->VisitExpr(op->args[2]);
       PrimExpr extent = this->VisitExpr(op->args[3]);
-      return Call(op->dtype, op->op,
-                  {op->args[0], merged_buf_var_, extra_offset + offset, extent,
-                   op->args[4]});
+      Array<PrimExpr> new_args{op->args[0], merged_buf_var_, extra_offset + offset, extent};
+      for (size_t i = 4; i < op->args.size(); ++i) {
+        new_args.push_back(op->args[i]);
+      }
+      return Call(op->dtype, op->op, new_args);
     } else if (op->op.same_as(builtin::ptx_cp_async())) {
-      ICHECK((op->args.size() == 5U) || (op->args.size() == 6U));
+      ICHECK_GE(op->args.size(), 5U);
       DataType dtype = op->dtype;
       Var buffer = Downcast<Var>(op->args[0]);
       if (!IsAppropriateSharedMemory(buffer)) {

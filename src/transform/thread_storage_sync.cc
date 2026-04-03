@@ -426,7 +426,7 @@ public:
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       PrimExpr expr = StmtExprMutator::VisitExpr_(op);
       op = expr.as<CallNode>();
-      ICHECK_EQ(op->args.size(), 5U);
+      ICHECK_GE(op->args.size(), 5U);
       Var buffer_var(Downcast<Var>(op->args[1]));
       const IntImmNode *flag = op->args[4].as<IntImmNode>();
       if ((flag->value & 1) && sync_scope_.rank == StorageRank::kGlobal &&

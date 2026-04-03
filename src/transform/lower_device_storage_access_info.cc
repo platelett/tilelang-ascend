@@ -88,7 +88,7 @@ private:
     // Specially handle the buffer packed intrinsic
     PrimExpr expr = StmtExprMutator::VisitExpr_(op);
     op = expr.as<CallNode>();
-    ICHECK_EQ(op->args.size(), 5U);
+    ICHECK_GE(op->args.size(), 5U);
     DataType dtype = op->args[0].dtype();
     const VarNode *buffer = op->args[1].as<VarNode>();
     Var buffer_var = Downcast<Var>(op->args[1]);

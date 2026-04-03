@@ -514,7 +514,7 @@ public:
   }
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(builtin::tvm_access_ptr())) {
-      ICHECK_EQ(op->args.size(), 5U);
+      ICHECK_GE(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
       const VarNode *buffer = op->args[1].as<VarNode>();
       auto it = alloc_map_.find(buffer);
@@ -530,8 +530,11 @@ public:
         offset =
             make_const(offset.dtype(), se->bits_offset / elem_bits) + offset;
       }
-      return Call(op->dtype, op->op,
-                  {op->args[0], se->alloc_var, offset, extent, op->args[4]});
+      Array<PrimExpr> new_args{op->args[0], se->alloc_var, offset, extent};
+      for (size_t i = 4; i < op->args.size(); ++i) {
+        new_args.push_back(op->args[i]);
+      }
+      return Call(op->dtype, op->op, new_args);
     } else {
       return StmtExprMutator::VisitExpr_(op);
     }
@@ -1758,6 +1761,9 @@ public:
       index = index / make_const(index.dtype(), factor);
       Array<PrimExpr> acc_args{e_dtype, info.new_buffer_var, index, extent,
                                flag};
+      for (size_t i = 5; i < op->args.size(); ++i) {
+        acc_args.push_back(op->args[i]);
+      }
       return Call(info.new_element_dtype, builtin::tvm_access_ptr(), acc_args);
 
     } else {
