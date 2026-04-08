@@ -57,6 +57,10 @@ struct CrossCoreSyncPoint {
   // Cross interval support
   int cross_interval = 1;
   const ForNode *stage_loop = nullptr;
+  int intra_stage_offset = 0;       // This sync point's position within the stage (0-indexed)
+  int sync_points_per_stage = 1;    // Total sync points K in this stage group
+  bool use_runtime_counter = false; // True if nested → needs runtime counter path
+  bool is_nested = false;           // True if inside for/if deeper than stage_loop
 
   std::string ToString() const {
     std::ostringstream oss;
@@ -117,6 +121,13 @@ public:
           sp.parent_for_nodes = current_loops_;
           sp.cross_interval = GetCrossInterval();
           sp.stage_loop = current_stage_loop_;
+          bool has_inner_loop = false;
+          if (current_stage_loop_ && stage_loop_depth_ >= 0) {
+            has_inner_loop = std::any_of(
+                current_loops_.begin() + stage_loop_depth_ + 1,
+                current_loops_.end(), [](const ForNode *f) { return true; });
+          }
+          sp.is_nested = has_inner_loop || (if_nesting_depth_ > 0);
           sync_points_.push_back(sp);
         }
       }
@@ -128,6 +139,7 @@ public:
 
     if (is_stage_loop) {
       current_stage_loop_ = op;
+      stage_loop_depth_ = current_loops_.size();
     }
 
     current_loops_.push_back(op);
@@ -136,7 +148,14 @@ public:
 
     if (is_stage_loop) {
       current_stage_loop_ = nullptr;
+      stage_loop_depth_ = -1;
     }
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) override {
+    if_nesting_depth_++;
+    StmtVisitor::VisitStmt_(op);
+    if_nesting_depth_--;
   }
 
   int GetCrossInterval() const {
@@ -144,7 +163,9 @@ public:
       auto interval_anno =
           current_stage_loop_->annotations.Get("tl_cross_interval");
       if (interval_anno.defined()) {
-        return interval_anno.as<IntImmNode>()->value;
+        if (auto *int_node = interval_anno.as<IntImmNode>()) {
+          return int_node->value;
+        }
       }
     }
     return 1;
@@ -157,6 +178,8 @@ private:
   int sync_flag_id_{0};
   std::vector<const ForNode *> current_loops_;
   const ForNode *current_stage_loop_ = nullptr;
+  int stage_loop_depth_ = -1;
+  int if_nesting_depth_ = 0;
 
   /**
    * The configuration info table
@@ -246,12 +269,100 @@ public:
       new_stmt = AttachSyncStmt(sp, new_stmt);
     }
 
+    for (const auto &sp : sync_points_) {
+      if (sp.stage_loop == op && sp.use_runtime_counter) {
+        GetOrCreateCounterBuf(op);
+        break;
+      }
+    }
+
+    auto it = counter_bufs_.find(op);
+    if (it != counter_bufs_.end()) {
+      Buffer buf = it->second;
+      auto i32 = DataType::Int(32);
+      PrimExpr zero = make_const(i32, 0);
+
+      Array<Stmt> flush_stmts;
+      for (const auto &sp : sync_points_) {
+        if (sp.stage_loop == op && sp.use_runtime_counter && sp.is_write) {
+          flush_stmts.push_back(GenAutoCrossCoreSetFlagStmt(sp));
+        }
+      }
+      flush_stmts.push_back(BufferStore(buf, zero, {zero}));
+
+      PrimExpr last_iter =
+          (op->loop_var == op->extent - make_const(op->loop_var.dtype(), 1));
+      PrimExpr has_pending = (BufferLoad(buf, {zero}) != zero);
+      Stmt epilogue =
+          IfThenElse(last_iter && has_pending, SeqStmt(flush_stmts),
+                     Evaluate(0));
+
+      // Find the ForNode inside new_stmt, which may be nested in SeqStmts
+      // after multiple AttachSyncStmt wrappings.
+      std::function<const ForNode *(const Stmt &)> find_for;
+      find_for = [&find_for](const Stmt &s) -> const ForNode * {
+        if (auto f = s.as<ForNode>()) return f;
+        if (auto seq = s.as<SeqStmtNode>()) {
+          for (const auto &child : seq->seq) {
+            if (auto f = find_for(child)) return f;
+          }
+        }
+        return nullptr;
+      };
+
+      const ForNode *for_node = find_for(new_stmt);
+      ICHECK(for_node)
+          << "Expected ForNode in stage loop after sync attachment";
+      Stmt body_with_epilogue = SeqStmt({for_node->body, epilogue});
+
+      Stmt init = BufferStore(buf, zero, {zero});
+      Stmt wrapped_for =
+          For(for_node->loop_var, for_node->min, for_node->extent,
+              for_node->kind, body_with_epilogue, for_node->thread_binding,
+              for_node->annotations);
+      Stmt counter_block = DeclBuffer(
+          buf, Allocate(buf->data, DataType::Int(32), {1}, const_true(),
+                        SeqStmt({init, wrapped_for})));
+
+      // Replace the ForNode in the (potentially nested) statement tree,
+      // preserving all surrounding sync statements from AttachSyncStmt.
+      std::function<Stmt(const Stmt &)> replace_for;
+      replace_for = [&replace_for, &for_node,
+                     &counter_block](const Stmt &s) -> Stmt {
+        if (s.as<ForNode>() == for_node) return counter_block;
+        if (auto seq = s.as<SeqStmtNode>()) {
+          Array<Stmt> new_seq;
+          for (const auto &child : seq->seq) {
+            new_seq.push_back(replace_for(child));
+          }
+          return SeqStmt(new_seq);
+        }
+        return s;
+      };
+      new_stmt = replace_for(new_stmt);
+    }
+
     return new_stmt;
   }
 
 private:
+  arith::Analyzer analyzer_;
+  std::unordered_map<const ForNode *, Buffer> counter_bufs_;
   int cur_order_{0};
   const std::vector<CrossCoreSyncPoint> &sync_points_;
+
+  Buffer GetOrCreateCounterBuf(const ForNode *stage_loop) {
+    auto it = counter_bufs_.find(stage_loop);
+    if (it != counter_bufs_.end()) {
+      return it->second;
+    }
+    std::string name = "cross_sync_cnt_" + std::to_string(counter_bufs_.size());
+    Var buf_var(name, DataType::Handle());
+    Buffer buf(buf_var, DataType::Int(32), {1}, {},
+               IntImm(DataType::Int(32), 0), name, 0, 0, kDefault);
+    counter_bufs_[stage_loop] = buf;
+    return buf;
+  }
 
   /**
    * SetFlag After Write, WaitFlag Before Read.
@@ -266,16 +377,23 @@ private:
     }
 
     if (sp.cross_interval > 1 && sp.stage_loop != nullptr) {
-      PrimExpr condition = GenSyncCondition(sp);
-      // op_stmt always executes, sync_stmt is conditional
-      if (sp.is_write) {
-        // writer: op_stmt first, then conditional sync
-        return SeqStmt(
-            {op_stmt, IfThenElse(condition, sync_stmt, Evaluate(0))});
+      if (sp.use_runtime_counter) {
+        auto [fire_cond, counter_update] = GenSyncConditionRuntime(sp);
+        Stmt cond_sync = IfThenElse(fire_cond, sync_stmt, Evaluate(0));
+        if (sp.is_write) {
+          return SeqStmt({op_stmt, cond_sync, counter_update});
+        } else {
+          return SeqStmt({cond_sync, counter_update, op_stmt});
+        }
       } else {
-        // reader: conditional sync first, then op_stmt
-        return SeqStmt(
-            {IfThenElse(condition, sync_stmt, Evaluate(0)), op_stmt});
+        PrimExpr condition = GenSyncConditionCompileTime(sp);
+        if (sp.is_write) {
+          return SeqStmt(
+              {op_stmt, IfThenElse(condition, sync_stmt, Evaluate(0))});
+        } else {
+          return SeqStmt(
+              {IfThenElse(condition, sync_stmt, Evaluate(0)), op_stmt});
+        }
       }
     }
 
@@ -286,31 +404,49 @@ private:
     }
   }
 
-  /**
-   * Generate sync condition based on cross_interval.
-   * Writer (set): (stage_var % cross_interval == cross_interval - 1) ||
-   * is_last_iteration Reader (wait): stage_var % cross_interval == 0
-   */
-  PrimExpr GenSyncCondition(const CrossCoreSyncPoint &sp) {
-    const ForNode *stage_loop = sp.stage_loop;
-    if (stage_loop == nullptr) {
-      return make_const(DataType::Bool(), true);
-    }
-    PrimExpr stage_var = stage_loop->loop_var;
-    PrimExpr stage_extent = stage_loop->extent;
-    int cross_interval = sp.cross_interval;
-    auto int32 = DataType::Int(32);
+  std::pair<PrimExpr, Stmt>
+  GenSyncConditionRuntime(const CrossCoreSyncPoint &sp) {
+    Buffer cnt_buf = GetOrCreateCounterBuf(sp.stage_loop);
+    auto i32 = DataType::Int(32);
+    PrimExpr zero = make_const(i32, 0);
+    int N = sp.cross_interval;
 
+    PrimExpr cur = BufferLoad(cnt_buf, {zero});
+
+    PrimExpr fire_cond;
     if (sp.is_write) {
-      PrimExpr mod_cond = EQ(Mod(stage_var, make_const(int32, cross_interval)),
-                             make_const(int32, cross_interval - 1));
-      PrimExpr last_iter_cond =
-          EQ(stage_var, Sub(stage_extent, make_const(int32, 1)));
-      return tir::Or(mod_cond, last_iter_cond);
+      fire_cond = (cur == make_const(i32, N - 1));
     } else {
-      return EQ(Mod(stage_var, make_const(int32, cross_interval)),
-                make_const(int32, 0));
+      fire_cond = (cur == zero);
     }
+
+    PrimExpr at_boundary = (cur == make_const(i32, N - 1));
+    PrimExpr new_val = if_then_else(at_boundary, zero, cur + make_const(i32, 1));
+    Stmt update = BufferStore(cnt_buf, new_val, {zero});
+
+    return {fire_cond, update};
+  }
+
+  PrimExpr GenSyncConditionCompileTime(const CrossCoreSyncPoint &sp) {
+    int K = sp.sync_points_per_stage;
+    int offset = sp.intra_stage_offset;
+    PrimExpr N = make_const(DataType::Int(32), sp.cross_interval);
+    PrimExpr stage_var = sp.stage_loop->loop_var;
+    PrimExpr extent = sp.stage_loop->extent;
+    PrimExpr gwi = stage_var * K + offset;
+
+    PrimExpr mod_cond;
+    if (sp.is_write) {
+      mod_cond = (FloorMod(gwi, N) == (N - 1));
+    } else {
+      mod_cond = (FloorMod(gwi, N) == 0);
+    }
+
+    if (sp.is_write && offset == K - 1) {
+      PrimExpr last_iter_guard = (stage_var == extent - 1);
+      return analyzer_.Simplify(mod_cond || last_iter_guard);
+    }
+    return analyzer_.Simplify(mod_cond);
   }
 
   /**
@@ -351,6 +487,9 @@ public:
 
     cube_collector(cube_code);
     vec_collector(vec_code);
+
+    AssignSyncStrategy(cube_sync_points);
+    AssignSyncStrategy(vec_sync_points);
 
     // Map to group sync points by workspace_name
     std::map<std::string, std::vector<CrossCoreSyncPoint *>> cube_ws_map;
@@ -429,6 +568,39 @@ private:
       return 1; // skip this loop by treating it as 1 iter
     }
     return GetLoopIterTimes(for_node);
+  }
+
+  static void AssignSyncStrategy(std::vector<CrossCoreSyncPoint> &sync_points) {
+    std::unordered_map<const ForNode *, std::vector<CrossCoreSyncPoint *>>
+        groups;
+    for (auto &sp : sync_points) {
+      if (sp.stage_loop != nullptr && sp.cross_interval > 1) {
+        groups[sp.stage_loop].push_back(&sp);
+      }
+    }
+
+    for (auto &[stage_loop, group] : groups) {
+      bool any_nested = std::any_of(group.begin(), group.end(),
+                                    [](const CrossCoreSyncPoint *sp) {
+                                      return sp->is_nested;
+                                    });
+      if (any_nested) {
+        for (auto *sp : group) {
+          sp->use_runtime_counter = true;
+        }
+      } else {
+        std::sort(group.begin(), group.end(),
+                  [](const CrossCoreSyncPoint *a,
+                     const CrossCoreSyncPoint *b) {
+                    return a->order < b->order;
+                  });
+        int K = static_cast<int>(group.size());
+        for (int i = 0; i < K; ++i) {
+          group[i]->intra_stage_offset = i;
+          group[i]->sync_points_per_stage = K;
+        }
+      }
+    }
   }
 
   // check if same depth & same name in both parent_for_nodes
