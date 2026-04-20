@@ -251,23 +251,41 @@ private:
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) override {
-    std::vector<Stmt> stmts;
-    InsertSynchronization("PipeBarrier_ALL", stmts);
+    // Branch-merge: visit each branch from the same pre-if history, then
+    // conservatively merge results. Avoids unconditional PipeBarrier_ALL —
+    // lets subsequent EvaluateNode handlers decide via normal dependency
+    // analysis. Ops not in operation_config_ (e.g. CombineCV's cross-core
+    // set_flag/wait_flag) produce empty histories, so no spurious barriers.
+    auto saved_history = current_access_history_;
 
-    current_access_history_.clear();
+    current_access_history_ = saved_history;
     Stmt then_case = VisitStmt(op->then_case);
+    auto then_history = current_access_history_;
 
     Optional<Stmt> else_case;
+    auto else_history = saved_history;
     if (op->else_case.defined()) {
-      current_access_history_.clear();
+      current_access_history_ = saved_history;
       else_case = VisitStmt(op->else_case.value());
+      else_history = current_access_history_;
     }
 
-    stmts.push_back(IfThenElse(op->condition, then_case, else_case));
+    // If both branches modify the same buffer on different pipelines
+    // (e.g. MTE2 vs V both writing UB), MergeAccessHistories cannot
+    // represent this. Fall back to PipeBarrier_ALL.
+    if (HasPipelineConflict(saved_history, then_history, else_history)) {
+      std::vector<Stmt> stmts;
+      InsertSynchronization("PipeBarrier_ALL", stmts);
+      stmts.push_back(IfThenElse(op->condition, then_case, else_case));
+      InsertSynchronization("PipeBarrier_ALL", stmts);
+      current_access_history_.clear();
+      return SeqStmt(stmts);
+    }
 
-    InsertSynchronization("PipeBarrier_ALL", stmts);
-    current_access_history_.clear();
-    return SeqStmt(stmts);
+    current_access_history_ =
+        MergeAccessHistories(saved_history, then_history, else_history);
+
+    return IfThenElse(op->condition, then_case, else_case);
   }
 
   Stmt MergeAndRebuildForLoops(const Stmt &processed_stmt,
@@ -1302,6 +1320,102 @@ private:
     for (const auto &access : current_accesses) {
       current_access_history_[access.buffer_name] = access;
     }
+  }
+
+  /*!
+   * \brief Check if both IfThenElse branches modify the same buffer on
+   *        different pipelines. MergeAccessHistories can only store one
+   *        pipeline per buffer, so this case requires fallback to
+   *        PipeBarrier_ALL.
+   */
+  bool HasPipelineConflict(
+      const std::unordered_map<std::string, BufferAccess> &pre_history,
+      const std::unordered_map<std::string, BufferAccess> &then_history,
+      const std::unordered_map<std::string, BufferAccess> &else_history) {
+    for (const auto &then_pair : then_history) {
+      const std::string &buf = then_pair.first;
+      auto else_it = else_history.find(buf);
+      if (else_it == else_history.end()) continue;
+
+      auto pre_it = pre_history.find(buf);
+      bool in_pre = (pre_it != pre_history.end());
+
+      bool then_changed = !in_pre ||
+          then_pair.second.operation != pre_it->second.operation ||
+          then_pair.second.is_write != pre_it->second.is_write;
+      bool else_changed = !in_pre ||
+          else_it->second.operation != pre_it->second.operation ||
+          else_it->second.is_write != pre_it->second.is_write;
+
+      if (then_changed && else_changed &&
+          then_pair.second.pipeline != else_it->second.pipeline) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /*!
+   * \brief Conservative merge of access histories from two IfThenElse branches.
+   *
+   * Since only one branch executes at runtime:
+   * - is_write = OR of both branches (conservative)
+   * - sync_graph/pipe_barriers cleared (no branch sync can be assumed)
+   * - Buffers untouched by either branch are preserved from pre_history
+   */
+  std::unordered_map<std::string, BufferAccess> MergeAccessHistories(
+      const std::unordered_map<std::string, BufferAccess> &pre_history,
+      const std::unordered_map<std::string, BufferAccess> &then_history,
+      const std::unordered_map<std::string, BufferAccess> &else_history) {
+    std::unordered_map<std::string, BufferAccess> merged = pre_history;
+
+    std::unordered_set<std::string> all_buffers;
+    for (const auto &pair : then_history)
+      all_buffers.insert(pair.first);
+    for (const auto &pair : else_history)
+      all_buffers.insert(pair.first);
+
+    for (const auto &buf : all_buffers) {
+      auto then_it = then_history.find(buf);
+      auto else_it = else_history.find(buf);
+      auto pre_it = pre_history.find(buf);
+
+      bool in_then = (then_it != then_history.end());
+      bool in_else = (else_it != else_history.end());
+      bool in_pre = (pre_it != pre_history.end());
+
+      bool then_changed =
+          in_then && (!in_pre || then_it->second.operation !=
+                                     pre_it->second.operation ||
+                      then_it->second.is_write != pre_it->second.is_write);
+      bool else_changed =
+          in_else && (!in_pre || else_it->second.operation !=
+                                     pre_it->second.operation ||
+                      else_it->second.is_write != pre_it->second.is_write);
+
+      if (!then_changed && !else_changed) {
+        continue;
+      }
+
+      BufferAccess result;
+      if (in_then) {
+        result = then_it->second;
+      } else {
+        result = else_it->second;
+      }
+
+      if (in_then && in_else) {
+        result.is_write = then_it->second.is_write || else_it->second.is_write;
+        result.is_sliced = then_it->second.is_sliced || else_it->second.is_sliced;
+      }
+
+      result.sync_graph = SyncGraph();
+      result.pipe_barriers.clear();
+
+      merged[buf] = result;
+    }
+
+    return merged;
   }
 
   std::string GetRequiredSyncType(const BufferAccess &prev_access,
