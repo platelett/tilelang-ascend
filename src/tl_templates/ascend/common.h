@@ -188,6 +188,10 @@ copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
   }
   if (maskShapeM != dstM || maskShapeN != dstN) {
     if constexpr (IsDuplicateSupported_v<T>) {
+      SetFlag<HardEvent::MTE2_V>(0);
+      WaitFlag<HardEvent::MTE2_V>(0);
+      SetFlag<HardEvent::MTE3_V>(0);
+      WaitFlag<HardEvent::MTE3_V>(0);
       AscendC::Duplicate<T>(dstTensor, padValue, dstM * dstN);
       SetFlag<HardEvent::V_MTE2>(0);
       WaitFlag<HardEvent::V_MTE2>(0);
@@ -356,10 +360,30 @@ reduce_sum_half(LocalTensor<T> const &dstTensor,
 }
 
 template <typename T, uint32_t M, uint32_t N, int32_t dim>
-CATLASS_DEVICE void reduce_sum(LocalTensor<T> const &dstTensor,
-                               LocalTensor<T> const &srcTensor,
-                               LocalTensor<uint8_t> const &sharedTmpBuffer) {
+CATLASS_DEVICE void
+reduce_sum(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
+           LocalTensor<uint8_t> const &sharedTmpBuffer, bool clear = true) {
   uint32_t shape[] = {M, N};
+  if (clear) {
+    if constexpr (dim == -1) {
+      AscendC::ReduceSum<T, AscendC::Pattern::Reduce::AR>(
+          dstTensor, srcTensor, sharedTmpBuffer, shape, true);
+    } else {
+      AscendC::ReduceSum<T, AscendC::Pattern::Reduce::RA>(
+          dstTensor, srcTensor, sharedTmpBuffer, shape, true);
+    }
+    return;
+  }
+
+  constexpr uint32_t kReduceResultLen = dim == -1 ? M : N;
+  // ReduceSum appears to use scratch in a way that can interfere with a local
+  // UB backup on real_shape/slice paths, so keep the old dst in scalar locals
+  // before forcing clear=true and merging manually.
+  T dstBackup[kReduceResultLen];
+  for (uint32_t i = 0; i < kReduceResultLen; ++i) {
+    dstBackup[i] = dstTensor.GetValue(i);
+  }
+
   if constexpr (dim == -1) {
     AscendC::ReduceSum<T, AscendC::Pattern::Reduce::AR>(
         dstTensor, srcTensor, sharedTmpBuffer, shape, true);
@@ -367,13 +391,51 @@ CATLASS_DEVICE void reduce_sum(LocalTensor<T> const &dstTensor,
     AscendC::ReduceSum<T, AscendC::Pattern::Reduce::RA>(
         dstTensor, srcTensor, sharedTmpBuffer, shape, true);
   }
+
+  for (uint32_t i = 0; i < kReduceResultLen; ++i) {
+    T reducedValue = dstTensor.GetValue(i);
+    dstTensor.SetValue(i, static_cast<T>(reducedValue + dstBackup[i]));
+  }
+}
+
+template <typename T>
+CATLASS_DEVICE T reduce_scalar_max_safe(T lhsValue, T rhsValue) {
+  // Bisheng/AICore does not allow scalar half/bfloat16 comparisons inside
+  // device code, so the clear=false fallback compares through float.
+  if constexpr (std::is_same_v<T, half> || std::is_same_v<T, bfloat16_t>) {
+    return static_cast<float>(lhsValue) > static_cast<float>(rhsValue)
+               ? lhsValue
+               : rhsValue;
+  } else {
+    return lhsValue > rhsValue ? lhsValue : rhsValue;
+  }
 }
 
 template <typename T, uint32_t M, uint32_t N, int32_t dim>
-CATLASS_DEVICE void reduce_max(LocalTensor<T> const &dstTensor,
-                               LocalTensor<T> const &srcTensor,
-                               LocalTensor<uint8_t> const &sharedTmpBuffer) {
+CATLASS_DEVICE void
+reduce_max(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
+           LocalTensor<uint8_t> const &sharedTmpBuffer, bool clear = true) {
   uint32_t shape[] = {M, N};
+  if (clear) {
+    if constexpr (dim == -1) {
+      AscendC::ReduceMax<T, AscendC::Pattern::Reduce::AR>(
+          dstTensor, srcTensor, sharedTmpBuffer, shape, true);
+    } else {
+      AscendC::ReduceMax<T, AscendC::Pattern::Reduce::RA>(
+          dstTensor, srcTensor, sharedTmpBuffer, shape, true);
+    }
+    return;
+  }
+
+  // AscendC::ReduceMax(..., clear=false) does not reliably preserve the
+  // upstream "merge old dst with reduced value" contract on real_shape/slice
+  // paths, so we make the merge explicit here.
+  constexpr uint32_t kReduceResultLen = dim == -1 ? M : N;
+  T dstBackup[kReduceResultLen];
+  for (uint32_t i = 0; i < kReduceResultLen; ++i) {
+    dstBackup[i] = dstTensor.GetValue(i);
+  }
+
   if constexpr (dim == -1) {
     AscendC::ReduceMax<T, AscendC::Pattern::Reduce::AR>(
         dstTensor, srcTensor, sharedTmpBuffer, shape, true);
@@ -381,22 +443,68 @@ CATLASS_DEVICE void reduce_max(LocalTensor<T> const &dstTensor,
     AscendC::ReduceMax<T, AscendC::Pattern::Reduce::RA>(
         dstTensor, srcTensor, sharedTmpBuffer, shape, true);
   }
+
+  // Keep the merge explicit instead of relying on an in-place vector max,
+  // because aliasing dst with one input can produce unstable results here.
+  for (uint32_t i = 0; i < kReduceResultLen; ++i) {
+    T reducedValue = dstTensor.GetValue(i);
+    T backupValue = dstBackup[i];
+    dstTensor.SetValue(i, reduce_scalar_max_safe(reducedValue, backupValue));
+  }
+}
+
+template <typename T>
+CATLASS_DEVICE T reduce_scalar_min_safe(T lhsValue, T rhsValue) {
+  // Bisheng/AICore does not allow scalar half/bfloat16 comparisons inside
+  // device code, so the clear=false fallback compares through float.
+  if constexpr (std::is_same_v<T, half> || std::is_same_v<T, bfloat16_t>) {
+    return static_cast<float>(lhsValue) < static_cast<float>(rhsValue)
+               ? lhsValue
+               : rhsValue;
+  } else {
+    return lhsValue < rhsValue ? lhsValue : rhsValue;
+  }
 }
 
 template <typename T, uint32_t M, uint32_t N, int32_t dim>
-CATLASS_DEVICE void reduce_min(LocalTensor<T> const &dstTensor,
-                               LocalTensor<T> const &srcTensor,
-                               LocalTensor<uint8_t> const &sharedTmpBuffer) {
+CATLASS_DEVICE void
+reduce_min(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
+           LocalTensor<uint8_t> const &sharedTmpBuffer, bool clear = true) {
   uint32_t shape[] = {M, N};
-  // if (count > 0) {
-  //   shape[1] = count / M;
-  // }
+  if (clear) {
+    if constexpr (dim == -1) {
+      AscendC::ReduceMin<T, AscendC::Pattern::Reduce::AR>(
+          dstTensor, srcTensor, sharedTmpBuffer, shape, true);
+    } else {
+      AscendC::ReduceMin<T, AscendC::Pattern::Reduce::RA>(
+          dstTensor, srcTensor, sharedTmpBuffer, shape, true);
+    }
+    return;
+  }
+
+  // AscendC::ReduceMin(..., clear=false) does not reliably preserve the
+  // upstream "merge old dst with reduced value" contract on real_shape/slice
+  // paths, so we make the merge explicit here.
+  constexpr uint32_t kReduceResultLen = dim == -1 ? M : N;
+  T dstBackup[kReduceResultLen];
+  for (uint32_t i = 0; i < kReduceResultLen; ++i) {
+    dstBackup[i] = dstTensor.GetValue(i);
+  }
+
   if constexpr (dim == -1) {
     AscendC::ReduceMin<T, AscendC::Pattern::Reduce::AR>(
         dstTensor, srcTensor, sharedTmpBuffer, shape, true);
   } else {
     AscendC::ReduceMin<T, AscendC::Pattern::Reduce::RA>(
         dstTensor, srcTensor, sharedTmpBuffer, shape, true);
+  }
+
+  // Keep the merge explicit instead of relying on an in-place vector min,
+  // because aliasing dst with one input can produce unstable results here.
+  for (uint32_t i = 0; i < kReduceResultLen; ++i) {
+    T reducedValue = dstTensor.GetValue(i);
+    T backupValue = dstBackup[i];
+    dstTensor.SetValue(i, reduce_scalar_min_safe(reducedValue, backupValue));
   }
 }
 
@@ -466,7 +574,7 @@ gemm_v0(LocalTensor<T1> const &A, LocalTensor<T1> const &B,
 // 2-way merge sort
 template <typename T>
 CATLASS_DEVICE void
-MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &tmp,
+MergeSort(const LocalTensor<T> &dst, const LocalTensor<uint8_t> &tmp,
           const LocalTensor<T> &src0, const LocalTensor<T> &src1,
           uint32_t blockLen0, uint32_t blockLen1) {
   // Note: tmp parameter is kept for API consistency with PTO backend but not
@@ -493,7 +601,7 @@ MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &tmp,
 // 3-way merge sort
 template <typename T>
 CATLASS_DEVICE void
-MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &tmp,
+MergeSort(const LocalTensor<T> &dst, const LocalTensor<uint8_t> &tmp,
           const LocalTensor<T> &src0, const LocalTensor<T> &src1,
           const LocalTensor<T> &src2, uint32_t blockLen0, uint32_t blockLen1,
           uint32_t blockLen2) {
@@ -521,7 +629,7 @@ MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &tmp,
 // 4-way merge sort
 template <typename T>
 CATLASS_DEVICE void
-MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &tmp,
+MergeSort(const LocalTensor<T> &dst, const LocalTensor<uint8_t> &tmp,
           const LocalTensor<T> &src0, const LocalTensor<T> &src1,
           const LocalTensor<T> &src2, const LocalTensor<T> &src3,
           uint32_t blockLen0, uint32_t blockLen1, uint32_t blockLen2,
@@ -545,26 +653,6 @@ MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &tmp,
 
   AscendC::MrgSort<T>(dst, srcList, params);
   PipeBarrier<PIPE_V>();
-}
-
-template <typename T>
-CATLASS_DEVICE void TopK(const LocalTensor<T> &dst, const LocalTensor<T> &src,
-                         const LocalTensor<T> &tmp, uint32_t blockSize) {
-  // 初始化合并排序参数
-  AscendC::MrgSort4Info params;
-  params.elementLengths[0] = blockSize;
-  params.elementLengths[1] = blockSize;
-  params.ifExhaustedSuspension = true;
-  params.validBit = 0b0011;
-  // 初始化源列表
-  AscendC::MrgSortSrcList<T> srcList;
-  srcList.src1 = dst;
-  srcList.src2 = src;
-  // 执行合并排序
-  AscendC::MrgSort<T>(tmp, srcList, params);
-  // PipeBarrier<PIPE_V>();
-  // 将结果复制到目标张量
-  AscendC::DataCopy(dst, tmp, blockSize * 2);
 }
 
 template <typename T>
@@ -911,6 +999,31 @@ CATLASS_DEVICE void ClampMax(const LocalTensor<T> &dst,
                              const LocalTensor<uint8_t> &tmp,
                              const T scalarValue, const int32_t count) {
   AscendC::ClampMax<T>(dst, buffer, tmp, scalarValue, count);
+}
+
+template <typename T>
+CATLASS_DEVICE void TopK(const LocalTensor<T> &dst, const LocalTensor<T> &src,
+                         const LocalTensor<T> &tmp, const int32_t K,
+                         const int32_t repeatTimes, const int32_t actualCount) {
+  // Use tmp as the full-size sort destination (2 * alignedCount elements).
+  // Sort writes its result into tmp's first region; we then copy the top-K
+  // portion into dst.
+  uint32_t alignedCount = repeatTimes * 32;
+  // sortDst needs 2 * alignedCount elements; reuse the tail of tmp.
+  // Layout of tmp: [0 .. 2*alignedCount-1] = sortDst, [2*alignedCount ..] =
+  // sortTmp
+  auto sortDst = tmp;
+  auto sortTmp = tmp[alignedCount * 2];
+  Sort<T>(sortDst, src, sortTmp, repeatTimes, actualCount);
+  PipeBarrier<PIPE_V>();
+  // Copy 2*K elements (interleaved value-index pairs) from sorted result to
+  // dst. DataCopy requires the byte count to be a multiple of 32 bytes, so
+  // round up.
+  uint32_t topkElems = 2 * K;
+  constexpr uint32_t elemsPerBlock = 32 / sizeof(T);
+  uint32_t alignedTopk =
+      ((topkElems + elemsPerBlock - 1) / elemsPerBlock) * elemsPerBlock;
+  AscendC::DataCopy(dst, sortDst, alignedTopk);
 }
 
 template <typename T>

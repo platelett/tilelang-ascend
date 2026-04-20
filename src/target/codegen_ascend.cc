@@ -657,14 +657,20 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
       this->PrintIndent();
       this->stream << "if ASCEND_IS_AIV {\n";
       this->PrintIndent();
-      this->PrintIndent();
-      this->stream << current_block_id << " = " << current_block_id
-                   << " / 2;\n";
+      if (cv_ratio_ != cv_1_1) {
+        this->PrintIndent();
+        this->stream << current_block_id << " = " << current_block_id
+                     << " / 2;\n";
+      }
       this->PrintIndent();
       this->stream << "}\n";
 
       this->core_num_ = PrintExpr(op->value);
     } else if (iv->thread_tag == "blockIdx.y" && iv->var->name_hint != "_") {
+      auto vec_id_ = AllocVarID(iv->var.get());
+      this->PrintIndent();
+      this->stream << "auto " << vec_id_ << " = AscendC::GetSubBlockIdx();\n";
+    } else if (iv->thread_tag == "threadIdx.x") {
       auto vec_id_ = AllocVarID(iv->var.get());
       this->PrintIndent();
       this->stream << "auto " << vec_id_ << " = AscendC::GetSubBlockIdx();\n";
@@ -771,8 +777,11 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
                        CodeGenTileLangAscend *p) { // NOLINT(*)
   // Type code is kBFloat
   if (op->dtype.is_bfloat16()) {
-    os << "bfloat16_t";
-    os << '(' << std::scientific << op->value << 'f' << ')';
+    if (std::isinf(op->value)) {
+      os << "bfloat16_t(" << (op->value < 0 ? "-" : "") << "CUDART_INF_F)";
+    } else {
+      os << "bfloat16_t(" << std::scientific << op->value << 'f' << ')';
+    }
     return;
   }
   // Type code is kFloat8_e5m2 or kE4M4Float
@@ -805,10 +814,15 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
     break;
   }
   case 16: {
-    os << "half" << '(';
-    FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
-    PrintConst(const_f32.get(), os, p);
-    os << ')';
+    // Only fp16 reaches here (bf16 is handled above)
+    if (std::isinf(op->value)) {
+      os << "half(" << (op->value < 0 ? "-" : "") << "CUDART_INF_F)";
+    } else {
+      os << "half(";
+      FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
+      PrintConst(const_f32.get(), os, p);
+      os << ')';
+    }
     break;
   }
   default:
@@ -821,10 +835,51 @@ void CodeGenTileLangAscend::VisitExpr_(const FloatImmNode *op,
   PrintConst(op, os, this);
 }
 
+void CodeGenTileLangAscend::VisitExpr_(const MulNode *op,
+                                       std::ostream &os) { // NOLINT(*)
+  // Detect pattern: inf * (-1) -> -inf
+  auto is_float_imm_inf = [](const PrimExpr &expr) -> bool {
+    if (auto *float_imm = expr.as<FloatImmNode>()) {
+      return std::isinf(float_imm->value);
+    }
+    return false;
+  };
+
+  auto is_neg_one = [](const PrimExpr &expr) -> bool {
+    if (auto *float_imm = expr.as<FloatImmNode>()) {
+      return float_imm->value == -1.0;
+    }
+    return false;
+  };
+
+  // Check if this is inf * (-1) or (-1) * inf pattern
+  if ((is_float_imm_inf(op->a) && is_neg_one(op->b)) ||
+      (is_float_imm_inf(op->b) && is_neg_one(op->a))) {
+    // Generate negated inf directly
+    if (auto *float_imm = op->a.as<FloatImmNode>()) {
+      FloatImm neg_inf(float_imm->dtype,
+                       -std::numeric_limits<double>::infinity());
+      PrintConst(neg_inf.get(), os, this);
+    } else if (auto *float_imm = op->b.as<FloatImmNode>()) {
+      FloatImm neg_inf(float_imm->dtype,
+                       -std::numeric_limits<double>::infinity());
+      PrintConst(neg_inf.get(), os, this);
+    }
+    return;
+  }
+
+  // Default handling
+  CodeGenC::VisitExpr_(op, os);
+}
+
 void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
   int func_scope = this->BeginScope();
   this->PrintIndent();
-  stream << "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);\n";
+  if (cv_ratio_ == cv_1_1) {
+    stream << "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);\n";
+  } else {
+    stream << "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);\n";
+  }
   this->PrintIndent();
   stream << "AscendC::TPipe pipe;\n\n";
 
@@ -1046,6 +1101,11 @@ void CodeGenTileLangAscend::AddFunction(const GlobalVar &gvar,
   ICHECK(global_symbol.defined())
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+
+  auto cv_ratio_opt = f->GetAttr<StringImm>("npu_cv_ratio");
+  if (cv_ratio_opt.defined()) {
+    cv_ratio_ = cv_ratio_opt.value().as<StringImmNode>()->value;
+  }
 
   this->PrintFuncPrefix(stream);
   CodeGenC::PrintType(f->ret_type, stream);
@@ -1427,7 +1487,10 @@ void CodeGenTileLangAscend::TopKCodegen(const CallNode *op) {
   std::string op_name =
       "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
   int len = op->args.size();
-  PrintOpCall(op, op_name, {1, len - 1}, {len - 1, len});
+  // args: [name, dst, src, tmp, K, repeatTimes, actual_num]
+  // buffers: args[1..3] (dst, src, tmp), scalars: args[4..6] (K, repeatTimes,
+  // actual_num)
+  PrintOpCall(op, op_name, {1, 4}, {4, len});
 }
 
 void CodeGenTileLangAscend::ShmemCodegen(const CallNode *op) {
@@ -1779,9 +1842,16 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
       "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
 
   bool is_reduce_sum = (op_name.find("reduce_sum") != std::string::npos);
+  int buffer_arg_end = static_cast<int>(op->args.size());
+  bool clear = true;
+  if (buffer_arg_end > 0 && op->args[buffer_arg_end - 1].dtype().is_bool()) {
+    clear = !is_zero(op->args[buffer_arg_end - 1]);
+    buffer_arg_end--;
+  }
+  std::string clear_str = clear ? "true" : "false";
 
   std::vector<std::string> var_names;
-  for (int i = 1; i < op->args.size(); i++) {
+  for (int i = 1; i < buffer_arg_end; i++) {
     auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
     var_names.push_back(var_name);
   }
@@ -1810,7 +1880,7 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
     } catch (...) {
     }
 
-    if (dtype == "half") {
+    if (dtype == "half" && clear) {
       std::string mask, repeatTime, srcRepStride;
       constexpr int64_t ELE_NUM_PER_C0_FOR_HALF = 16;
       if (dim_val == -1) {
@@ -1844,7 +1914,10 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
           this->stream << ", ";
         }
       }
-      this->stream << ");\n";
+      if (!var_names.empty()) {
+        this->stream << ", ";
+      }
+      this->stream << clear_str << ");\n";
     }
   } else {
     this->stream << op_name << "(";
@@ -1854,7 +1927,10 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
         this->stream << ", ";
       }
     }
-    this->stream << ");\n";
+    if (!var_names.empty()) {
+      this->stream << ", ";
+    }
+    this->stream << clear_str << ");\n";
   }
 }
 

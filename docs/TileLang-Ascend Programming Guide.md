@@ -592,14 +592,35 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
 ##### 4.1.3.2 Reduce类
 
-- `T.reduce_sum(buffer: Buffer, out: Buffer, tmp: Buffer, dim: int)`
+当前 Ascend reduce 仍然属于 fast-path 原语，主要服务于 UB tile / slice buffer 场景。本次接口语义与实现边界如下：
+
+- 当前支持 1D buffer、2D buffer，以及 3D trailing-tile buffer；当前主要验收范围是 2D UB/slice reduce。
+- `dim` 支持范围：
+  - 1D buffer：`0` / `-1`
+  - 2D buffer：`0` / `1` / `-1` / `-2`
+  - 3D buffer：仅支持 trailing-tile 轴 `0` / `1` / `-1` / `-2`
+- `clear=True` 表示先初始化输出再写入 reduce 结果；`clear=False` 表示在已有 `out` 上做 merge：
+  - `reduce_sum`：将 reduce 结果与已有 `out` 相加
+  - `reduce_max`：将 reduce 结果与已有 `out` 逐元素取最大值
+  - `reduce_min`：将 reduce 结果与已有 `out` 逐元素取最小值
+- `real_shape` 用于描述 2D slice buffer 的逻辑有效区域；未设置时默认使用物理 buffer 形状。
+- `out` 一般可以使用两类 shape：
+  - 压缩后的 reduce 结果 shape。例如输入为 `[M, N]` 时，`dim=-1` 可输出为 `[M]`，`dim=0` 可输出为 `[N]`。
+  - keepdim 形式的 shape，即保留被规约的轴，但该轴长度变为 `1`。例如输入为 `[M, N]` 时，`dim=-1` 可输出为 `[M, 1]`，`dim=0` 可输出为 `[1, N]`。
+- `keepdim` 不表示输出 shape 可以任意保持为与输入 buffer 相同的 shape；只有在被规约轴本身长度就是 `1` 的退化情况下，数值上才可能与输入 shape 一致。
+- 对 2D slice buffer 且设置了 `real_shape` 的兼容路径，`out` 还允许保持部分 physical-layout 形式，例如 `[physical_cols]` 或 `[1, physical_cols]`；这是为了兼容当前后端对 slice buffer 的 lowering 方式。
+- 非法 `dim`、非法 `real_shape`、非法 `out` shape 会在前端直接报错，而不是静默进入后端。
+- `clear` 和 `real_shape` 同时支持关键字传参和兼容的 positional 传参形式，建议优先使用关键字形式以获得更清晰的可读性。
+
+- `T.reduce_sum(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, real_shape: list[int] | None = None)`
 
   **参数**：
 
   - buffer：输入buffer
   - out：目的输出buffer
-  - tmp：临时申请buffer
-  - dim：reduce轴（-1：last dim）
+  - dim：reduce轴
+  - clear：是否在计算前清空输出buffer
+  - real_shape：2D slice buffer 的逻辑有效范围
 
   **功能说明**：
 
@@ -615,27 +636,29 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
   ![image-tilelang_ascend_reducesum_2](./images/image-tilelang_ascend_reducesum_2.png)
 
-  **注意**：
-
-  由于该接口的内部实现中涉及复杂的数学计算，需要额外的临时空间来存储计算过程中的中间变量。临时空间通过sharedTmpBuffer入参传入。
+  以上图示均以 `clear=True` 为例，主要说明不同 `dim` 下的 reduce 方向、输出 shape 和 reduce 结果本身。当 `clear=False` 时，reduce 的轴语义和输出 shape 约束保持不变，只是在得到 reduce 结果后，还会再与已有 `out` 按对应规则做 merge，而不是直接覆盖写入。
 
   **举例**：
 
   ```
-  tmp_ub = T.alloc_ub([3 * DataType(accum_dtype).bits // 8 * block_M // 2 * block_N], "uint8")
-  T.reduce_sum(acc_s_ub, sumexp_i_ub, tmp_ub, dim=-1)
+  T.reduce_sum(acc_s_ub, sumexp_i_ub, dim=-1)
   ```
 
-  
+  带 `clear=False` 的示例：
 
-- `T.reduce_max(buffer: Buffer, out: Buffer, tmp: Buffer, dim: int)`
+  ```
+  T.reduce_sum(acc_s_ub, sumexp_i_ub, dim=-1, clear=False)
+  ```
+
+- `T.reduce_max(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, real_shape: list[int] | None = None)`
 
   **参数**：
 
-  - buffer：输入buffer（2D）
+  - buffer：输入buffer
   - out：目的输出buffer
-  - tmp：临时申请buffer
-  - dim：reduce轴（-1：last dim）
+  - dim：reduce轴
+  - clear：是否在计算前清空输出buffer
+  - real_shape：2D slice buffer 的逻辑有效范围
 
   **功能说明**：
 
@@ -651,25 +674,27 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
   ![image-tilelang_ascend_reducemax_2](./images/image-tilelang_ascend_reducemax_2.png)
 
-  **注意**：
-
-  由于该接口的内部实现中涉及复杂的数学计算，需要额外的临时空间来存储计算过程中的中间变量。临时空间通过sharedTmpBuffer入参传入。
-
   **举例**：
 
   ```
-  tmp_ub = T.alloc_ub([3 * DataType(accum_dtype).bits // 8 * block_M // 2 * block_N], "uint8")
-  T.reduce_max(acc_s_ub, m_i, tmp_ub, dim=-1)
+  T.reduce_max(acc_s_ub, m_i, dim=-1)
   ```
 
-- `T.reduce_min(buffer: Buffer, out: Buffer, tmp: Buffer, dim: int)`  
+  带 `real_shape` 的示例：
+
+  ```
+  T.reduce_max(in_shared, out_shared, dim=-1, real_shape=[4, 4])
+  ```
+
+- `T.reduce_min(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, real_shape: list[int] | None = None)`
 
   **参数**：
 
   - buffer：输入buffer
   - out：目的输出buffer
-  - tmp：临时申请buffer
-  - dim：reduce轴（-1：last dim）
+  - dim：reduce轴
+  - clear：是否在计算前清空输出buffer
+  - real_shape：2D slice buffer 的逻辑有效范围
 
   **功能说明**：
 
@@ -685,17 +710,63 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
   ![image-tilelang_ascend_reducemin_2](./images/image-tilelang_ascend_reducemin_2.png)
 
-  **注意**：
-
-  由于该接口的内部实现中涉及复杂的数学计算，需要额外的临时空间来存储计算过程中的中间变量。临时空间通过sharedTmpBuffer入参传入。
-
   **举例**：
 
   ```
-  tmp = T.alloc_ub((2 * sub_block_M, N), "uint8")
-  T.reduce_min(a_ub, b_ub, tmp, dim=-1)
+  T.reduce_min(a_ub, b_ub, dim=-1)
   ```
-  
+
+  Slice buffer 与基础 reduce 示例可参考：
+
+  - `examples/reduce/example_row_reduce_max_slice_buffer.py`
+  - `examples/reduce/example_col_reduce_max_slice_buffer.py`
+  - `examples/reduce/example_reduce_min.py`
+
+  **`clear=False` 语义补充说明**：
+
+  `clear=False` 不会改变 reduce 的方向、输出 shape 或 `real_shape` 的解释方式；它只会在 reduce 结果产生之后，再与已有 `out` 做一次 merge。可以将其理解为：
+
+  - 第一步：按 `clear=True` 的方式先得到 reduce 结果 `reduced_result`
+  - 第二步：将 `reduced_result` 与已有 `out` 合并，得到新的输出 `new_out`
+
+  对三种 reduce 的 merge 规则分别为：
+
+  - `reduce_sum`：`new_out = old_out + reduced_result`
+  - `reduce_max`：`new_out = max(old_out, reduced_result)`
+  - `reduce_min`：`new_out = min(old_out, reduced_result)`
+
+  以二维输入 `[M, N]` 为例：
+
+  - 当 `dim=-1` 时，先沿最后一维得到 `[M]` 或 `[M, 1]` 形式的 `reduced_result`，再与已有 `out` 做 merge。
+  - 当 `dim=0` 时，先沿第一维得到 `[N]` 或 `[1, N]` 形式的 `reduced_result`，再与已有 `out` 做 merge。
+
+  `reduce_sum` 的一个简单数值示例如下：
+
+  ```
+  input =
+  [[1, 2, 3],
+   [4, 5, 6]]
+
+  reduced_result = reduce_sum(input, dim=-1) = [6, 15]
+  old_out = [10, 20]
+  new_out = old_out + reduced_result = [16, 35]
+  ```
+
+  下面三张图分别以 `reduce_sum`、`reduce_max` 和 `reduce_min` 为例，展示 `clear=False` 的增量 merge 语义。三张图都沿用前文 `clear=True` 图示中已经说明的 reduce 方向和 `reduced_result` 含义，新增表达的重点是：已有 `old_out` 会与 `reduced_result` 做一次 merge，得到新的输出 `new_out`。
+
+  - `reduce_sum`：`new_out = old_out + reduced_result`
+
+  ![image-tilelang_ascend_clear_false_reducesum](./images/image-tilelang_ascend_clear_false_reducesum.png)
+
+  - `reduce_max`：`new_out = max(old_out, reduced_result)`
+
+  ![image-tilelang_ascend_clear_false_reducemax](./images/image-tilelang_ascend_clear_false_reducemax.png)
+
+  - `reduce_min`：`new_out = min(old_out, reduced_result)`
+
+  ![image-tilelang_ascend_clear_false_reducemin](./images/image-tilelang_ascend_clear_false_reducemin.png)
+
+  从这三张图可以看出，`clear=False` 并不会改变 reduce 轴本身的定义，也不会改变输出 shape 的约束；它只是在 reduce 结果生成之后，再根据操作类型执行一次额外的 merge。
 
 ##### 4.1.3.3 Element-wise math类
 
@@ -1167,8 +1238,8 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 | ReLU       | T.tile.relu(dst, src0)                   | element-wise 进行ReLU激活计算，dst = max(0, src0)            |
 | LeakeyReLU | T.tile.leaky_relu(dst, src0, scalar)     | element-wise 进行Leaky ReLU激活计算，dst = src0 if src0 >= 0 else src0 * scalar |
 | AXPY       | T.tile.axpy(dst, src0, scalar)           | element-wise 进行AXPY计算，dst = scalar * src0 + dst         |
-| 正弦       | T.tile.sin(dst, src0, tmp)               | element-wise 进行sin计算，dst = sin(src)                     |
-| 余弦       | T.tile.cos(dst, src0, tmp)               | element-wise 进行cos计算，dst = sin(src)                     |
+| 正弦       | T.tile.sin(dst, src0)               | element-wise 进行sin计算，dst = sin(src)                     |
+| 余弦       | T.tile.cos(dst, src0)               | element-wise 进行cos计算，dst = sin(src)                     |
 | 与         | T.tile.bitwise_and(dst, src0, src1)      | element-wise bitwise AND，dst = src0 & src1                  |
 | 或         | T.tile.bitwise_or(dst, src0, src1)       | element-wise bitwise OR，dst = src0                          |
 | 非         | T.tile.bitwise_not(dst, src0)            | element-wise bitwise NOT，dst = ~src0                        |
@@ -1444,13 +1515,12 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   T.tile.axpy(c_ub, a_ub, scalar)
   ```
 
-- `T.tile.sin(dst, src0, tmp)`:
+- `T.tile.sin(dst, src0)`:
 
   **参数**：
 
   - dst：计算结果存放目的buffer
   - src0：源操作数，数据类型为buffer类型
-  - tmp：内部计算需要提供的临时申请的缓冲区
 
   **功能**：element-wise 进行sin计算，dst = sin(src)
 
@@ -1458,16 +1528,15 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   ```
   #a_ub逐元素进行sin计算，结果存放到c_ub
-  T.tile.sin(c_ub, a_ub, tmp)
+  T.tile.sin(c_ub, a_ub)
   ```
 
-- `T.tile.cos(dst, src0, tmp)`:
+- `T.tile.cos(dst, src0)`:
 
   **参数**：
 
   - dst：计算结果存放目的buffer
   - src0：源操作数，数据类型为buffer类型
-  - tmp：内部计算需要提供的临时申请的缓冲区
 
   **功能**：element-wise 进行cos计算，dst = cos(src)
 
@@ -1475,7 +1544,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   ```
   #a_ub逐元素进行计算cos，结果存放到c_ub
-  T.tile.cos(c_ub, a_ub, tmp)
+  T.tile.cos(c_ub, a_ub)
   ```
 
 **(2) 逻辑计算**
@@ -1747,27 +1816,29 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
 ###### 4.1.3.2.7 排序组合
 
-- `T.tile.sort(dst, src, indices, tmp_buffer, repeat_time):`
+- `T.tile.sort(dst, src, actual_num):`
 
   **参数**：
 
-  - dst：保存排序后的数据的存储buffer
-  - src：源操作数，待排序数据
-  - indices：存储排序元素原始索引的缓冲区
-  - tmp_buffer：排序计算硬件所需的临时缓冲区
-  - repeat_time：重复迭代次数
+  - dst：存储排序后结果的目标缓冲区(val0, index0, val1, index1 ,...)
+  - src：源操作数，待排序数据(val0, val1, val2, ...)
+  - actual_num：src 中实际参与排序的元素数量
 
-  **功能**：排序函数，按照数值大小进行降序排序。
-
-  更详细说明，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0842.html
+  **功能**：排序函数，将任意长度数据按照数值大小进行一次性降序排序
 
   **举例**：
 
   ```
-  T.tile.sort(dst, src, indices, tmp_buffer, repeat_time)
+  # 对131个数进行排序
+  # 131向上对齐到160，src.shape = (1, 160), actual_num = 131
+  T.tile.sort(dst, src, actual_num)
   ```
 
-- `T.tile.merge_sort(dst, tmp, src0, src1, src2=None, src3=None):`
+  **注意事项**：
+  - `dst`与 `src` 数据类型相同，仅支持float32和float16数据类型
+  - `src` 的大小需要满足32或32的整数倍
+
+- `T.tile.merge_sort(dst, src0, src1, src2=None, src3=None):`
 
   **参数**：
 
@@ -1794,13 +1865,13 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   ```python
   # 2-way 归并
-  T.tile.merge_sort(merge_dst, merge_tmp, src0, src1)
+  T.tile.merge_sort(merge_dst, src0, src1)
 
   # 3-way 归并
-  T.tile.merge_sort(merge_dst, merge_tmp, src0, src1, src2)
+  T.tile.merge_sort(merge_dst, src0, src1, src2)
 
   # 4-way 归并
-  T.tile.merge_sort(merge_dst, merge_tmp, src0, src1, src2, src3)
+  T.tile.merge_sort(merge_dst, src0, src1, src2, src3)
   ```
 
   **注意事项**：
@@ -1811,26 +1882,30 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   更详细说明，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0232.html
 
-- `T.tile.topk(dst, src, tmp_buffer, block_size):`
+- `T.tile.topk(dst, src, K, actual_num):`
 
   **参数**：
 
-  - dst：存储TopK结果的目标缓冲区
-  - src：包含输入数据的源缓冲区
-  - tmp_buffer：用于处理过程中中间计算的临时缓冲区
-  - block_size：待处理数据块的大小
+  - dst：存储TopK结果的目标缓冲区(val0, index0, val1, index1 ,...)
+  - src：包含输入数据的源缓冲区(val0, val1, val2, ...)
+  - K：前K个排序结果
+  - actual_num：实际参与排序的元素个数
 
-  **功能**：获取最后一个维度的前k个最大值或最小值及其对应的索引。
-
-  更详细说明，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0836.html
+  **功能**：执行 TopK 操作，实现对源数据的一次性从大到小排序，选择前K个元素，以（数、索引）的方式输出
 
   **举例**:
 
   ```
-  T.tile.topk(topk_global, sort_result, sort_temp, top_k)
+  # 对41个数进行排序，选择前10个数
+  # 需要使41向上对齐至32 * 2 = 64，K = 10, actual_num = 41
+  # topk_global.shape = (1, 20)sort_result.shape = (1, 64)
+  T.tile.topk(topk_global, sort_result, K, actual_num)
   ```
 
-###### 4.1.3.2.6 数据分散/收集
+  **注意事项**：
+  - `src` 的大小需要满足32或32的整数倍
+
+###### 4.1.3.2.8 数据分散/收集
 
 - `T.tile.gather(dst, src, src_offset, src_base_addr):`
 
@@ -1851,7 +1926,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   T.tile.gather(c_ub, a_ub, b_ub, 0)
   ```
 
-###### 4.1.3.2.7 索引操作
+###### 4.1.3.2.9 索引操作
 
 - `T.tile.arith_progression(buffer, first_value, diff_value, count):`
 
@@ -1870,6 +1945,22 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   ```
   T.tile.arith_progression(sort_indices, 0, 1, block_N)
+  ```
+
+###### 4.1.3.2.10 数据清除
+
+- `T.tile.clear(buffer):`
+
+  **参数**：
+
+  - buffer：要填充的数据buffer
+
+  **功能**：将数据buffer填充为0，实现buffer清空操作。
+
+  **举例**：
+
+  ```
+  T.tile.clear(ub)；
   ```
 
 #### 4.1.4 同步原语
@@ -2149,7 +2240,3 @@ g.replay()
 | 2026.1.22 | Initial release | Chaoyang Ji |
 | 2026.2.03 | MsProf update   | Yuhan Zhang |
 | 2026.3.12 | aclgraph        |   Di He     |
-
-
-
-

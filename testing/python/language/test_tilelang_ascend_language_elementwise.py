@@ -8,6 +8,9 @@ import torch.nn as nn
 
 import tilelang
 import tilelang.language as T
+import tilelang.language.reduce_ascend as reduce_ascend_lang
+
+tir = tilelang.tvm.tir
 
 """
 This is an element-wise pytest automation test suite.
@@ -48,6 +51,15 @@ def assert_close_npu(actual, expected, dtype, rtol=1e-2, atol=1e-2, **kwargs):
         torch.testing.assert_close(actual.to(torch.int32), expected.to(torch.int32), rtol=rtol, atol=atol, **kwargs)
     else:
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, **kwargs)
+
+
+def _get_reduce_fn(op: str):
+    reduce_fns = {
+        "sum": T.reduce_sum,
+        "max": T.reduce_max,
+        "min": T.reduce_min,
+    }
+    return reduce_fns[op]
 
 
 def vec_abs(M, N, block_M, block_N, dtype="float"):
@@ -451,7 +463,6 @@ def bilinear_interpolation(mask, h_repeat, repeat_mode, dst_blk_stride, v_r_offs
             src0_offset_ub = T.alloc_ub((src0offset.shape[0] // VEC_NUM, src0offset.shape[1]), "uint32")
             src1_ub = T.alloc_ub((src1.shape[0] // VEC_NUM, src1.shape[1]), "float16")
             dst_ub = T.alloc_ub((src0.shape[0] // VEC_NUM, src0.shape[1] // 2), "float16")
-            shared_tmp_buffer_ub = T.alloc_ub((src0.shape[0], src0.shape[1]), "uint8")
 
             T.copy(src0[0, 0], src0_ub)
             T.copy(src0_offset[0, 0], src0_offset_ub)
@@ -468,7 +479,6 @@ def bilinear_interpolation(mask, h_repeat, repeat_mode, dst_blk_stride, v_r_offs
                 dst_blk_stride,
                 v_r_offset,
                 v_repeat,
-                shared_tmp_buffer_ub,
             )
 
             T.copy(dst_ub, dst[0, 0])
@@ -874,12 +884,11 @@ def bitwise_xor(M, N, block_M, block_N, dtype="int16"):
             a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            tmp_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
 
             T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
             T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
 
-            T.tile.bitwise_xor(c_ub, a_ub, b_ub, tmp_ub)
+            T.tile.bitwise_xor(c_ub, a_ub, b_ub)
 
             T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
@@ -934,12 +943,11 @@ def bitwise_xor_slice(M, N, block_M, block_N, dtype="int16"):
             a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            tmp_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
 
             T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
             T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
             for i in range(block_M // VEC_NUM):
-                T.tile.bitwise_xor(c_ub[i, :], a_ub[i, :], b_ub[i, :], tmp_ub)
+                T.tile.bitwise_xor(c_ub[i, :], a_ub[i, :], b_ub[i, :])
 
             T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
@@ -1354,11 +1362,10 @@ def clamp(M, N, block_M, block_N, max_val, min_val, dtype="float16"):
             block_size = block_M * block_N // VEC_NUM
             in_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             out_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            tmp_ub = T.alloc_ub((block_M // VEC_NUM, block_N), "uint8")
 
             T.copy(input[bx * block_M + vid * block_M // VEC_NUM, by * block_N], in_ub)
 
-            T.tile.clamp(out_ub, in_ub, tmp_ub, min_val, max_val, block_size)
+            T.tile.clamp(out_ub, in_ub, min_val, max_val, block_size)
 
             T.copy(out_ub, output[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
@@ -1410,11 +1417,9 @@ def clamp_slice(M, N, block_M, block_N, max_val, min_val, dtype="float16"):
             block_size = block_M * block_N // VEC_NUM
             in_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             out_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            tmp_ub = T.alloc_ub((block_M // VEC_NUM, block_N), "uint8")
-
             T.copy(input[bx * block_M + vid * block_M // VEC_NUM, by * block_N], in_ub)
             for i in range(block_M // VEC_NUM):
-                T.tile.clamp(out_ub[i, :], in_ub[i, :], tmp_ub, min_val, max_val, block_size)
+                T.tile.clamp(out_ub[i, :], in_ub[i, :], min_val, max_val, block_size)
 
             T.copy(out_ub, output[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
@@ -1794,12 +1799,11 @@ def cos(M, N, block_M, block_N, dtype="float"):
             by = cid % n_num
             a = T.alloc_ub([sub_block_M, block_N], dtype)
             b = T.alloc_ub([sub_block_M, block_N], dtype)
-            tmp = T.alloc_ub([2 * sub_block_M * block_N], "uint8")
 
             T.copy(
                 A[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N], a
             )  # Load input
-            T.tile.cos(b, a, tmp)  # Compute cos
+            T.tile.cos(b, a)  # Compute cos
             T.copy(
                 b, B[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N]
             )  # Store output
@@ -1844,13 +1848,12 @@ def cos_slice(M, N, block_M, block_N, dtype="float"):
             by = cid % n_num
             a = T.alloc_ub([sub_block_M, block_N], dtype)
             b = T.alloc_ub([sub_block_M, block_N], dtype)
-            tmp = T.alloc_ub([2 * sub_block_M * block_N], "uint8")
 
             T.copy(
                 A[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N], a
             )  # Load input
             for i in range(sub_block_M):
-                T.tile.cos(b[i, :], a[i, :], tmp)  # Compute cos
+                T.tile.cos(b[i, :], a[i, :])  # Compute cos
             T.copy(
                 b, B[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N]
             )  # Store output
@@ -2094,6 +2097,45 @@ def run_test_fill(M, N, block_M, block_N, dtype, target):
 def test_fill(dtype, target, shape):
     M, N = shape
     run_test_fill(M, N, 64, 32, dtype, target=target)
+
+
+def clear(M, N, block_M, block_N, dtype="float"):
+    m_num = M // block_M
+    n_num = N // block_N
+
+    @T.prim_func
+    def main(A: T.Tensor((M, N), dtype)):  # type: ignore
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+            bx = cid // n_num
+            by = cid % n_num
+            a_ub = T.alloc_ub((block_M, block_N), dtype)
+
+            T.tile.fill(a_ub, 10.0)
+            T.tile.clear(a_ub)
+            T.copy(a_ub, A[bx * block_M, by * block_N])
+
+    return main
+
+
+def run_test_clear(M, N, block_M, block_N, dtype, target):
+    func = clear(M, N, block_M, block_N, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    torch.npu.synchronize()
+
+    b = func()
+
+    ref_b = torch.zeros((M, N), dtype=torch.float32 if dtype == "float" else torch.float16).npu()
+
+    torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", ["float", "float16"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize("shape", [(1024, 1024)])
+def test_clear(dtype, target, shape):
+    M, N = shape
+    run_test_clear(M, N, 64, 32, dtype, target=target)
 
 
 def gather(M, N, block_M, block_N, dtype="int32"):
@@ -3116,8 +3158,6 @@ def vec_pow(M, N, block_M, block_N, dtype="float"):
 
     VEC_NUM = 2
 
-    tmp_size_multiplier = 8 if dtype == "int32" else 2
-
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),  # type: ignore
@@ -3131,12 +3171,11 @@ def vec_pow(M, N, block_M, block_N, dtype="float"):
             a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            tmp = T.alloc_ub((tmp_size_multiplier * (block_M // VEC_NUM), block_N), "uint8")
 
             T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
             T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
 
-            T.tile.pow(c_ub, a_ub, b_ub, tmp)
+            T.tile.pow(c_ub, a_ub, b_ub)
 
             T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
@@ -3192,8 +3231,6 @@ def vec_pow_slice(M, N, block_M, block_N, dtype="float"):
 
     VEC_NUM = 2
 
-    tmp_size_multiplier = 8 if dtype == "int32" else 2
-
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),  # type: ignore
@@ -3207,12 +3244,11 @@ def vec_pow_slice(M, N, block_M, block_N, dtype="float"):
             a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
-            tmp = T.alloc_ub((tmp_size_multiplier * (block_M // VEC_NUM), block_N), "uint8")
 
             T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
             T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
             for i in range(block_M // VEC_NUM):
-                T.tile.pow(c_ub[i, :], a_ub[i, :], b_ub[i, :], tmp)
+                T.tile.pow(c_ub[i, :], a_ub[i, :], b_ub[i, :])
 
             T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
@@ -3620,11 +3656,10 @@ def sin(M, N, block_M, block_N, dtype="float"):
             by = cid % n_num
             a = T.alloc_ub([sub_block_M, block_N], dtype)
             b = T.alloc_ub([sub_block_M, block_N], dtype)
-            tmp = T.alloc_ub([2 * sub_block_M * block_N], "uint8")
             T.copy(
                 A[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N], a
             )  # Load input
-            T.tile.sin(b, a, tmp)  # Compute sin
+            T.tile.sin(b, a)  # Compute sin
             T.copy(
                 b, B[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N]
             )  # Store output
@@ -3669,12 +3704,11 @@ def sin_slice(M, N, block_M, block_N, dtype="float"):
             by = cid % n_num
             a = T.alloc_ub([sub_block_M, block_N], dtype)
             b = T.alloc_ub([sub_block_M, block_N], dtype)
-            tmp = T.alloc_ub([2 * sub_block_M * block_N], "uint8")
             T.copy(
                 A[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N], a
             )  # Load input
             for i in range(sub_block_M):
-                T.tile.sin(b[i, :], a[i, :], tmp)  # Compute sin
+                T.tile.sin(b[i, :], a[i, :])  # Compute sin
             T.copy(
                 b, B[bx * block_M + vid * sub_block_M : bx * block_M + (vid + 1) * sub_block_M, by * block_N : (by + 1) * block_N]
             )  # Store output
@@ -3721,11 +3755,10 @@ def sort(M, N, block_M, block_N, dtype="float"):
 
             src_ub = T.alloc_ub((block_M // VEC_NUM, ub_N), dtype)
             dst_ub = T.alloc_ub((block_M // VEC_NUM, ub_N * 2), dtype)
-            tmp_ub = T.alloc_ub((block_M // VEC_NUM, ub_N * 2), dtype)
 
             T.copy(a[bx * block_M + vid * block_M // VEC_NUM, by * ub_N], src_ub)
 
-            T.tile.sort(dst_ub, src_ub, tmp_ub, block_N)
+            T.tile.sort(dst_ub, src_ub, block_N)
 
             T.copy(dst_ub, b[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
 
@@ -3737,7 +3770,7 @@ def run_test_sort(M, N, block_M, block_N, dtype, target):
     func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
 
     torch_dtype = torch.float if dtype == "float" else torch.float16
-    a = torch.randn(M, N, dtype=torch_dtype).npu()
+    a = torch.arange(0, M * N, dtype=torch_dtype).reshape(M, N).npu()
     b = func(a)
 
     b_cpu = b.cpu().float().reshape(-1)
@@ -3860,6 +3893,68 @@ def test_sort32(dtype, target, shape):
     block_M = 64
     block_N = 128
     run_test_sort32(M, N, block_M, block_N, dtype, target)
+
+
+def topk(M, N, K, block_M, block_N, dtype="float"):
+    m_num = M // block_M
+    n_num = N // block_N
+
+    VEC_NUM = 1
+
+    ub_N = ((block_N + 31) // 32) * 32
+
+    @T.prim_func
+    def main(
+        a: T.Tensor((M, N), dtype),
+        b: T.Tensor((M, 2 * K), dtype),
+    ):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
+            bx = cid // n_num
+            by = cid % n_num
+
+            src_ub = T.alloc_ub((block_M // VEC_NUM, ub_N), dtype)
+            dst_ub = T.alloc_ub((block_M // VEC_NUM, K * 2), dtype)
+
+            T.copy(a[bx * block_M + vid * block_M // VEC_NUM, by * ub_N], src_ub)
+
+            T.tile.topk(dst_ub, src_ub, K, block_N)
+
+            T.copy(dst_ub, b[bx * block_M + vid * block_M // VEC_NUM, by * block_N])
+
+    return main
+
+
+def run_test_topk(M, N, K, block_M, block_N, dtype, target):
+    func = topk(M, N, K, block_M, block_N, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    torch_dtype = torch.float if dtype == "float" else torch.float16
+    a = torch.arange(0, M * N, dtype=torch_dtype).reshape(M, N).npu()
+    b = func(a)
+
+    b_cpu = b.cpu().float().reshape(-1)
+    a_cpu = a.cpu().float().reshape(-1)
+
+    out_values = b_cpu[0::2][:K]
+    out_indices = b_cpu[1::2][:K]
+
+    topk_vals, topk_index = torch.sort(a_cpu, descending=True)
+    ref_values = topk_vals[:K]
+    ref_indices = topk_index[:K].float()
+
+    torch.testing.assert_close(out_values, ref_values, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(out_indices, ref_indices.float(), rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float"])
+@pytest.mark.parametrize("target", ["ascendc"])
+@pytest.mark.parametrize("shape", [(1, 51)])
+def test_topk(dtype, target, shape):
+    M, N = shape
+    block_M = 1
+    block_N = 51
+    K = 10
+    run_test_topk(M, N, K, block_M, block_N, dtype, target)
 
 
 def sqrt(M, N, block_M, block_N, dtype="float"):
@@ -4354,11 +4449,9 @@ def reduce_sum(M, N, block_M, block_N, dim, dtype="float"):
             a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             b_ub = T.alloc_ub((block_M // VEC_NUM), dtype)
 
-            tmp_ub = T.alloc_ub((block_M * block_N * 4), "uint8")
-
             T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
 
-            T.reduce_sum(a_ub, b_ub, tmp_ub, dim, [block_M // VEC_NUM, block_N])
+            T.reduce_sum(a_ub, b_ub, dim, [block_M // VEC_NUM, block_N])
             T.barrier_all()
 
             T.copy(b_ub, B[bx * block_M + vid * block_M // VEC_NUM])
@@ -4369,7 +4462,6 @@ def reduce_sum(M, N, block_M, block_N, dim, dtype="float"):
 def run_test_reduce_sum(M, N, block_M, block_N, dim, dtype, target):
     func = reduce_sum(M, N, block_M, block_N, dim, dtype)
     func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
-    print(func.get_kernel_source())
 
     a = torch.randn(M, N, dtype=torch.float32 if dtype == "float" else torch.float16).npu()
     b = torch.zeros(M, dtype=torch.float32).npu()
@@ -4381,9 +4473,6 @@ def run_test_reduce_sum(M, N, block_M, block_N, dim, dtype, target):
         ref_b = torch.sum(a, dim=1)
     else:
         ref_b = torch.sum(a, dim=0)
-    print(a)
-    print(b)
-    print(ref_b)
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
@@ -4411,11 +4500,9 @@ def reduce_max(M, N, block_M, block_N, dim, dtype="float"):
             a_ub = T.alloc_ub((block_M, block_N), dtype)
             b_ub = T.alloc_ub((block_M), dtype)
 
-            tmp_ub = T.alloc_ub((block_M * block_N * 4), "uint8")
-
             T.copy(A[bx * block_M, by * block_N], a_ub)
 
-            T.reduce_max(a_ub, b_ub, tmp_ub, dim, [block_M, block_N])
+            T.reduce_max(a_ub, b_ub, dim, [block_M, block_N])
 
             T.copy(b_ub, B[bx * block_M])
 
@@ -4425,7 +4512,6 @@ def reduce_max(M, N, block_M, block_N, dim, dtype="float"):
 def run_test_reduce_max(M, N, block_M, block_N, dim, dtype, target):
     func = reduce_max(M, N, block_M, block_N, dim, dtype)
     func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
-    print(func.get_kernel_source())
 
     a = torch.randn(M, N, dtype=torch.float32 if dtype == "float" else torch.float16).npu()
 
@@ -4437,8 +4523,6 @@ def run_test_reduce_max(M, N, block_M, block_N, dim, dtype, target):
         ref_b = torch.max(a, dim=1)[0]
     else:
         ref_b = torch.max(a, dim=0)[0]
-    print(b)
-    print(ref_b)
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
@@ -4466,11 +4550,9 @@ def reduce_min(M, N, block_M, block_N, dim, dtype="float"):
             a_ub = T.alloc_ub((block_M, block_N), dtype)
             b_ub = T.alloc_ub((block_M), dtype)
 
-            tmp_ub = T.alloc_ub((block_M * block_N * 4), "uint8")
-
             T.copy(A[bx * block_M, by * block_N], a_ub)
 
-            T.reduce_min(a_ub, b_ub, tmp_ub, dim, [block_M, block_N])
+            T.reduce_min(a_ub, b_ub, dim, [block_M, block_N])
 
             T.copy(b_ub, B[bx * block_M])
 
@@ -4480,7 +4562,6 @@ def reduce_min(M, N, block_M, block_N, dim, dtype="float"):
 def run_test_reduce_min(M, N, block_M, block_N, dim, dtype, target):
     func = reduce_min(M, N, block_M, block_N, dim, dtype)
     func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
-    print(func.get_kernel_source())
 
     a = torch.randn(M, N, dtype=torch.float32 if dtype == "float" else torch.float16).npu()
 
@@ -4492,8 +4573,6 @@ def run_test_reduce_min(M, N, block_M, block_N, dim, dtype, target):
         ref_b = torch.min(a, dim=1)[0]
     else:
         ref_b = torch.min(a, dim=0)[0]
-    print(b)
-    print(ref_b)
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
@@ -4503,6 +4582,160 @@ def run_test_reduce_min(M, N, block_M, block_N, dim, dtype, target):
 def test_reduce_min(dim, dtype, target):
     M, N = 1024, 64
     run_test_reduce_min(M, N, 64, 64, dim, dtype, target)
+
+
+def reduce_runtime_semantics_kernel(M, N, op, dim, clear=True, init_value=0.0, dtype="float"):
+    reduce_fn = _get_reduce_fn(op)
+    output_size = M if dim == -1 else N
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),  # type: ignore
+        B: T.Tensor((output_size,), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (_, vid):
+            a_ub = T.alloc_ub((M, N), dtype)
+            b_ub = T.alloc_ub((output_size,), dtype)
+
+            if vid == 0:
+                T.copy(A, a_ub)
+                if not clear:
+                    T.tile.fill(b_ub, init_value)
+                reduce_fn(a_ub, b_ub, dim=dim, clear=clear)
+                T.copy(b_ub, B)
+
+    return main
+
+
+def reduce_runtime_reference(a, op, dim, clear=True, init_value=0.0):
+    reduce_dim = 1 if dim == -1 else 0
+    if op == "sum":
+        reduced = torch.sum(a, dim=reduce_dim)
+    elif op == "max":
+        reduced = torch.max(a, dim=reduce_dim).values
+    else:
+        reduced = torch.min(a, dim=reduce_dim).values
+
+    if clear:
+        return reduced
+
+    init = torch.full_like(reduced, init_value)
+    if op == "sum":
+        return reduced + init
+    if op == "max":
+        return torch.maximum(reduced, init)
+    return torch.minimum(reduced, init)
+
+
+def run_test_reduce_runtime_semantics(op, dim, target, clear=True, init_value=0.0):
+    M, N = 64, 64
+    func = reduce_runtime_semantics_kernel(M, N, op, dim, clear=clear, init_value=init_value, dtype="float")
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    a = torch.randn(M, N, dtype=torch.float32).npu()
+    torch.npu.synchronize()
+    b = func(a)
+
+    ref_b = reduce_runtime_reference(a, op, dim, clear=clear, init_value=init_value)
+    torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("op", ["sum", "max", "min"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_reduce_dim0_runtime_smoke(op, target):
+    run_test_reduce_runtime_semantics(op, dim=0, target=target, clear=True)
+
+
+@pytest.mark.parametrize(
+    ("op", "init_value"),
+    [
+        pytest.param("sum", 1.25, id="sum"),
+        pytest.param("max", -0.5, id="max"),
+        pytest.param("min", 0.5, id="min"),
+    ],
+)
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_reduce_clear_false_runtime_merge(op, init_value, target):
+    run_test_reduce_runtime_semantics(op, dim=-1, target=target, clear=False, init_value=init_value)
+
+
+@pytest.mark.parametrize("op", ["sum", "max", "min"])
+def test_reduce_api_compat_positional_and_keyword(monkeypatch, op):
+    captured = []
+
+    def fake_reduce_with_clear(buffer, out, reduce_type, dim, clear, real_shape):
+        captured.append((reduce_type, dim, clear, real_shape))
+        return "ok"
+
+    monkeypatch.setattr(reduce_ascend_lang, "_reduce_with_clear", fake_reduce_with_clear)
+
+    reduce_fn = _get_reduce_fn(op)
+    input_buffer = tir.decl_buffer((4, 8), "float32")
+    output_buffer = tir.decl_buffer((4,), "float32")
+
+    assert reduce_fn(input_buffer, output_buffer, dim=-1) == "ok"
+    assert reduce_fn(input_buffer, output_buffer, dim=-1, clear=False) == "ok"
+    assert reduce_fn(input_buffer, output_buffer, -1, False) == "ok"
+    assert reduce_fn(input_buffer, output_buffer, dim=0, real_shape=[4, 8]) == "ok"
+    assert reduce_fn(input_buffer, output_buffer, 0, [4, 8]) == "ok"
+    assert reduce_fn(input_buffer, output_buffer, 0, [4, 8], False) == "ok"
+    assert reduce_fn(input_buffer, output_buffer, 0, False, [4, 8]) == "ok"
+
+    expected_reduce_type = f"reduce_{op}"
+    assert captured == [
+        (expected_reduce_type, -1, True, None),
+        (expected_reduce_type, -1, False, None),
+        (expected_reduce_type, -1, False, None),
+        (expected_reduce_type, 0, True, [4, 8]),
+        (expected_reduce_type, 0, True, [4, 8]),
+        (expected_reduce_type, 0, False, [4, 8]),
+        (expected_reduce_type, 0, False, [4, 8]),
+    ]
+
+
+@pytest.mark.parametrize("op", ["sum", "max", "min"])
+@pytest.mark.parametrize(("dim", "expected_dim"), [(1, -1), (-2, 0)])
+def test_reduce_axis_legalization(monkeypatch, op, dim, expected_dim):
+    captured = []
+
+    def fake_reduce_with_clear(buffer, out, reduce_type, dim, clear, real_shape):
+        captured.append((reduce_type, dim, clear, real_shape))
+        return "ok"
+
+    monkeypatch.setattr(reduce_ascend_lang, "_reduce_with_clear", fake_reduce_with_clear)
+
+    reduce_fn = _get_reduce_fn(op)
+    input_buffer = tir.decl_buffer((4, 8), "float32")
+    output_buffer = tir.decl_buffer((4,), "float32")
+
+    assert reduce_fn(input_buffer, output_buffer, dim=dim) == "ok"
+    assert captured == [(f"reduce_{op}", expected_dim, True, None)]
+
+
+@pytest.mark.parametrize("op", ["sum", "max", "min"])
+@pytest.mark.parametrize("axis", [2, -3], ids=lambda axis: f"axis{axis}")
+def test_reduce_invalid_axis_raises_value_error(op, axis):
+    reduce_fn = _get_reduce_fn(op)
+    input_buffer = tir.decl_buffer((4, 8), "float32")
+    output_buffer = tir.decl_buffer((8,), "float32")
+    with pytest.raises(ValueError):
+        reduce_fn(input_buffer, output_buffer, dim=axis)
+
+
+@pytest.mark.parametrize(
+    ("input_shape", "real_shape", "dim", "out_shape"),
+    [
+        pytest.param((4, 8), (4, 4), -1, (8,), id="row-slice-flat-physical-layout"),
+        pytest.param((4, 8), (4, 4), -1, (1, 8), id="row-slice-keepdim-physical-layout"),
+        pytest.param((5, 8), (3, 4), 0, (1, 8), id="col-slice-keepdim-physical-layout"),
+    ],
+)
+def test_reduce_slice_buffer_physical_output_shape_is_accepted(input_shape, real_shape, dim, out_shape):
+    input_buffer = tir.decl_buffer(input_shape, "float32")
+    output_buffer = tir.decl_buffer(out_shape, "float32")
+    result = T.reduce_sum(input_buffer, output_buffer, dim=dim, real_shape=list(real_shape))
+    assert isinstance(result, tir.Call)
+    assert result.op.same_as(tir.op.Op.get("tl.ascend_reduce"))
 
 
 if __name__ == "__main__":
