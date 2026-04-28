@@ -428,25 +428,36 @@ private:
   }
 
   PrimExpr GenSyncConditionCompileTime(const CrossCoreSyncPoint &sp) {
-    int K = sp.sync_points_per_stage;
-    int offset = sp.intra_stage_offset;
+    // Cross-interval gating depends only on the stage loop's iteration
+    // variable (and not on the sync point's intra-stage offset / count K).
+    //
+    // Set semantics : "I have produced ci batches of data, signal once."
+    //   => fire when (stage_var + 1) % ci == 0, and ALSO on the very last
+    //      iteration of the stage loop (tail batch may be partial).
+    // Wait semantics: "Producer prepared ci batches, skip the next ci-1 waits."
+    //   => fire when stage_var % ci == 0; no tail guard needed.
+    //
+    // This matches the manual pattern in expert-mode kernels:
+    //   if ((i + 1) % ci == 0) or (i == last):  set_cross_flag(...)
+    //   if (i % ci == 0):                       wait_cross_flag(...)
+    //
+    // The previous formulation `gwi = stage_var * K + offset` mixed sets and
+    // waits in a single global numbering, which silently dropped some
+    // workspaces' syncs (causing aicore-timeout deadlocks) whenever K was
+    // even relative to ci. See git log for details.
     PrimExpr N = make_const(DataType::Int(32), sp.cross_interval);
     PrimExpr stage_var = sp.stage_loop->loop_var;
     PrimExpr extent = sp.stage_loop->extent;
-    PrimExpr gwi = stage_var * K + offset;
 
-    PrimExpr mod_cond;
+    PrimExpr cond;
     if (sp.is_write) {
-      mod_cond = (FloorMod(gwi, N) == (N - 1));
-    } else {
-      mod_cond = (FloorMod(gwi, N) == 0);
-    }
-
-    if (sp.is_write && offset == K - 1) {
+      PrimExpr mod_cond = (FloorMod(stage_var, N) == (N - 1));
       PrimExpr last_iter_guard = (stage_var == extent - 1);
-      return analyzer_.Simplify(mod_cond || last_iter_guard);
+      cond = mod_cond || last_iter_guard;
+    } else {
+      cond = (FloorMod(stage_var, N) == 0);
     }
-    return analyzer_.Simplify(mod_cond);
+    return analyzer_.Simplify(cond);
   }
 
   /**
