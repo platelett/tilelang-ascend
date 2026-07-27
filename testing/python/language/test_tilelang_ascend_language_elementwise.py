@@ -716,8 +716,22 @@ def run_test_bitwise_lshift(M, N, block_M, block_N, scalarvalue, dtype, target):
     assert_close_npu(b, ref_b, dtype, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("dtype", ["int16", "int32", "uint16", "uint32"])
-@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "int16",
+        "int32",
+        pytest.param("uint16", marks=pytest.mark.low_priority),
+        pytest.param("uint32", marks=pytest.mark.low_priority),
+    ],
+)
+@pytest.mark.parametrize(
+    "target",
+    [
+        "ascendc",
+        pytest.param("pto", marks=pytest.mark.low_priority),
+    ],
+)
 @pytest.mark.parametrize("shape", [(1024, 1024)])
 def test_bitwise_lshift(dtype, target, shape):
     M, N = shape
@@ -896,8 +910,22 @@ def run_test_bitwise_rshift(M, N, block_M, block_N, scalarvalue, dtype, target):
     assert_close_npu(b, ref_b, dtype, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("dtype", ["int16", "int32", "uint16", "uint32"])
-@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "int16",
+        "int32",
+        pytest.param("uint16", marks=pytest.mark.low_priority),
+        pytest.param("uint32", marks=pytest.mark.low_priority),
+    ],
+)
+@pytest.mark.parametrize(
+    "target",
+    [
+        "ascendc",
+        pytest.param("pto", marks=pytest.mark.low_priority),
+    ],
+)
 @pytest.mark.parametrize("shape", [(1024, 1024)])
 def test_bitwise_rshift(dtype, target, shape):
     M, N = shape
@@ -1140,6 +1168,7 @@ def run_test_block_reduce_max(M, N, block_M, block_N, repeat, mask, dstRepStride
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("dtype", ["float16"])
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_block_reduce_max(dtype, target):
@@ -1209,6 +1238,7 @@ def run_test_block_reduce_min(M, N, block_M, block_N, repeat, mask, dstRepStride
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("dtype", ["float16"])
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_block_reduce_min(dtype, target):
@@ -1278,6 +1308,7 @@ def run_test_block_reduce_sum(M, N, block_M, block_N, repeat, mask, dstRepStride
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("dtype", ["float16"])
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_block_reduce_sum(dtype, target):
@@ -1931,6 +1962,7 @@ def run_test_cos(dtype, target):
         torch.testing.assert_close(b, ref_b, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("dtype", ["float", "float16"])
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_cos(dtype, target):
@@ -1981,6 +2013,7 @@ def run_test_cos_slice(dtype, target):
         torch.testing.assert_close(b, ref_b, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("dtype", ["float", "float16"])
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_cos_slice(dtype, target):
@@ -3870,6 +3903,7 @@ def run_test_sin(dtype, target):
         torch.testing.assert_close(b, ref_b, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("dtype", ["float", "float16"])
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_sin(dtype, target):
@@ -3919,6 +3953,7 @@ def run_test_sin_slice(dtype, target):
         torch.testing.assert_close(b, ref_b, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("dtype", ["float", "float16"])
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_sin_slice(dtype, target):
@@ -4350,6 +4385,8 @@ def run_test_transpose(M, N, block_M, block_N, dtype, target):
     dtype_map = {
         "float": torch.float32,
         "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "int8": torch.int8,
         "int16": torch.int16,
         "int32": torch.int32,
         "uint16": torch.uint16,
@@ -4357,10 +4394,10 @@ def run_test_transpose(M, N, block_M, block_N, dtype, target):
     }
     torch_dtype = dtype_map.get(dtype, torch.float32)
 
-    if dtype in ["int16", "int32", "uint16", "uint32"]:
-        a = torch.randint(
-            -100 if dtype in ["int16", "int32"] else 0, 100 if dtype in ["int16", "int32"] else 200, (M, N), dtype=torch_dtype
-        ).npu()
+    if dtype in ["int8", "int16", "int32", "uint16", "uint32"]:
+        lo = -100 if dtype in ["int8", "int16", "int32"] else 0
+        hi = 100 if dtype in ["int8", "int16", "int32"] else 200
+        a = torch.randint(lo, hi, (M, N), dtype=torch_dtype).npu()
     else:
         a = torch.randn(M, N, dtype=torch_dtype).npu()
 
@@ -4373,8 +4410,23 @@ def run_test_transpose(M, N, block_M, block_N, dtype, target):
     assert_close_npu(b, ref_b, dtype, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("dtype", ["int16", "uint16", "float16", "int32", "uint32", "float"])
-@pytest.mark.parametrize("target", ["ascendc", "pto"])
+transpose_dtype_target_params = [
+    ("int16", "ascendc"),
+    ("int16", "pto"),
+    ("uint16", "ascendc"),
+    ("uint16", "pto"),
+    ("float16", "ascendc"),
+    ("float16", "pto"),
+    ("int32", "ascendc"),
+    pytest.param("int32", "pto", marks=pytest.mark.low_priority),
+    ("uint32", "ascendc"),
+    ("uint32", "pto"),
+    ("float", "ascendc"),
+    ("float", "pto"),
+]
+
+
+@pytest.mark.parametrize("dtype,target", transpose_dtype_target_params)
 @pytest.mark.parametrize("shape", [(16, 16)])
 def test_transpose(dtype, target, shape):
     M, N = shape
@@ -4387,6 +4439,57 @@ def test_transpose(dtype, target, shape):
 def test_transpose_tiled(dtype, target, shape):
     M, N = shape
     run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["float16"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize("shape", [(48, 48), (16, 48), (48, 16), (128, 128)])
+def test_transpose_block_b16(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["float", "uint32", "uint16"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize("shape", [(16, 16), (32, 32)])
+def test_transpose_block_b32(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype,target", [("int8", "ascendc"), ("bfloat16", "ascendc")])
+@pytest.mark.parametrize("shape", [(32, 32)])
+def test_transpose_fallback_dtype(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize("target", ["ascendc"])
+@pytest.mark.parametrize("shape", [(16, 16)])
+def test_transpose_fallback_dtype_16x16(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((20, 36), "float16"),
+        ((17, 33), "float16"),
+        ((24, 40), "float16"),
+        ((16, 33), "float16"),
+        ((33, 16), "float16"),
+        ((16, 16), "int8"),
+    ],
+    ids=["20x36-f16", "17x33-f16", "24x40-f16", "16x33-f16", "33x16-f16", "16x16-i8"],
+)
+def test_transpose_non_aligned_shape_raises(shape, dtype):
+    M, N = shape
+    src = tir.decl_buffer((M, N), dtype)
+    dst = tir.decl_buffer((N, M), dtype)
+    with pytest.raises(ValueError, match="32-byte alignment"):
+        T.tile.transpose(dst, src)
 
 
 def wholereducemax(M, N, block_M, block_N, mask, repeatTimes, dstRepStride, srcBlkStride, srcRepStride, dtype="float16"):
@@ -4442,6 +4545,7 @@ def run_test_wholereducemax(M, N, block_M, block_N, mask, repeatTimes, dstRepStr
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_wholereducemax(target):
     M = 2
@@ -4509,6 +4613,7 @@ def run_test_wholereducemin(M, N, block_M, block_N, mask, repeatTimes, dstRepStr
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_wholereducemin(target):
     M = 2
@@ -4573,6 +4678,7 @@ def run_test_wholereducesum(M, N, block_M, block_N, mask, repeatTimes, dstRepStr
     torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("target", ["ascendc"])
 def test_wholereducesum(target):
     M = 2
@@ -4623,6 +4729,7 @@ def run_test_generate_arithmetic_progression(N, block_size, target):
     torch.testing.assert_close(result, ref_result, rtol=0, atol=0)
 
 
+@pytest.mark.low_priority
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
 @pytest.mark.parametrize("shape", [1024])
 def test_generate_arithmetic_progression(target, shape):
@@ -4937,6 +5044,203 @@ def test_reduce_slice_buffer_physical_output_shape_is_accepted(input_shape, real
     result = T.reduce_sum(input_buffer, output_buffer, dim=dim, real_shape=list(real_shape))
     assert isinstance(result, tir.Call)
     assert result.op.same_as(tir.op.Op.get("tl.ascend_reduce"))
+
+
+def brcb_experiment_kernel(M, dtype="float"):
+    elems_per_block = 8 if dtype == "float" else 16
+    repeat_times = M // 8
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M,), dtype),  # type: ignore
+        C: T.Tensor((M, elems_per_block), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            a_ub = T.alloc_ub((M,), dtype)
+            c_ub = T.alloc_ub((M, elems_per_block), dtype)
+
+            T.copy(A, a_ub)
+            T.tile.brcb_experiment(c_ub, a_ub, repeat_times, 1, 8)
+            T.copy(c_ub, C)
+
+    return main
+
+
+def generate_golden_brcb(src, repeat_times, dtype):
+    elems_per_block = 32 // src.element_size()
+    total_dst = repeat_times * 8 * elems_per_block
+    result = torch.zeros(total_dst, dtype=src.dtype)
+    for rep in range(repeat_times):
+        for blk in range(8):
+            src_idx = rep * 8 + blk
+            dst_base = (rep * 8 + blk) * elems_per_block
+            for j in range(elems_per_block):
+                result[dst_base + j] = src[src_idx]
+    return result
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_brcb_experiment(dtype, target):
+    torch_dtype = torch.float16 if dtype == "float16" else torch.float32
+    elems_per_block = 32 // torch.tensor([], dtype=torch_dtype).element_size()
+    M = 64
+    repeat_times = M // 8
+
+    func = brcb_experiment_kernel(M, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    a = torch.arange(1, M + 1, dtype=torch_dtype).npu()
+    torch.npu.synchronize()
+
+    c = func(a)
+    torch.npu.synchronize()
+    ref_c = generate_golden_brcb(a.cpu(), repeat_times, torch_dtype).reshape(M, elems_per_block).npu()
+
+    torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-2, atol=1e-2)
+
+
+def _row_expand_binop_experiment_kernel(M, N, op_name, dtype="float16"):
+    block_M = 16
+    VEC_NUM = 2
+    elems_per_block = 16 if dtype == "float16" else 8
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),  # type: ignore
+        S: T.Tensor((M,), dtype),  # type: ignore
+        C: T.Tensor((M, N), dtype),  # type: ignore
+    ):
+        with T.Kernel(M // block_M, is_npu=True) as (cid, vid):
+            a_ub = T.alloc_ub((block_M // VEC_NUM, N), dtype)
+            s_ub = T.alloc_ub((block_M // VEC_NUM,), dtype)
+            tmp_ub = T.alloc_ub((block_M // VEC_NUM, elems_per_block), dtype)
+            c_ub = T.alloc_ub((block_M // VEC_NUM, N), dtype)
+
+            T.copy(A[cid * block_M + vid * block_M // VEC_NUM, 0], a_ub)
+            T.copy(S[cid * block_M + vid * block_M // VEC_NUM], s_ub)
+            getattr(T.tile, op_name)(c_ub, a_ub, s_ub, tmp_ub)
+            T.copy(c_ub, C[cid * block_M + vid * block_M // VEC_NUM, 0])
+
+    return main
+
+
+def row_expand_mul_experiment_kernel(M, N, dtype="float16"):
+    return _row_expand_binop_experiment_kernel(M, N, "row_expand_mul_experiment", dtype)
+
+
+def row_expand_sub_experiment_kernel(M, N, dtype="float16"):
+    return _row_expand_binop_experiment_kernel(M, N, "row_expand_sub_experiment", dtype)
+
+
+def row_expand_div_experiment_kernel(M, N, dtype="float16"):
+    return _row_expand_binop_experiment_kernel(M, N, "row_expand_div_experiment", dtype)
+
+
+@pytest.mark.parametrize("dtype,shape", [("float16", (16, 128)), ("float", (16, 64))])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_row_expand_mul_experiment(dtype, target, shape):
+    M, N = shape
+    func = row_expand_mul_experiment_kernel(M, N, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    torch_dtype = torch.float16 if dtype == "float16" else torch.float32
+    a = torch.randn(M, N, dtype=torch_dtype).npu()
+    s = torch.randn(M, dtype=torch_dtype).npu()
+    torch.npu.synchronize()
+
+    c = func(a, s)
+    torch.npu.synchronize()
+    ref_c = a * s.unsqueeze(1).expand(M, N)
+
+    torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype,shape", [("float16", (16, 128)), ("float", (16, 64))])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_row_expand_sub_experiment(dtype, target, shape):
+    M, N = shape
+    func = row_expand_sub_experiment_kernel(M, N, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    torch_dtype = torch.float16 if dtype == "float16" else torch.float32
+    a = torch.randn(M, N, dtype=torch_dtype).npu()
+    s = torch.randn(M, dtype=torch_dtype).npu()
+    torch.npu.synchronize()
+
+    c = func(a, s)
+    torch.npu.synchronize()
+    ref_c = a - s.unsqueeze(1).expand(M, N)
+
+    torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype,shape", [("float16", (16, 128)), ("float", (16, 64))])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_row_expand_div_experiment(dtype, target, shape):
+    M, N = shape
+    func = row_expand_div_experiment_kernel(M, N, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    torch_dtype = torch.float16 if dtype == "float16" else torch.float32
+    a = torch.randn(M, N, dtype=torch_dtype).npu()
+    s = torch.randn(M, dtype=torch_dtype).npu()
+    s = torch.clamp(s, min=0.1)
+    torch.npu.synchronize()
+
+    c = func(a, s)
+    torch.npu.synchronize()
+    ref_c = a / s.unsqueeze(1).expand(M, N)
+
+    torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-2, atol=1e-2)
+
+
+def exp_experiment_kernel(M, N, col, dtype="float"):
+    # exp_experiment exps a 64-col (fp32) / 128-col (fp16) chunk of every row per
+    # call, striding the buffer's physical column count between rows; callers loop
+    # chunks over the valid window. `col` picks how many chunks fire (1 / 2 / 4).
+    chunk = 64 if dtype == "float" else 128
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),  # type: ignore
+        C: T.Tensor((M, N), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            a_ub = T.alloc_ub((M, N), dtype)
+            T.copy(A, a_ub)
+            # Strided masked exp over [0:col] in place; the [col:N] tail is untouched.
+            for k in range(col // chunk):
+                sc = k * chunk
+                T.tile.exp_experiment(a_ub[:, sc : sc + chunk], a_ub[:, sc : sc + chunk])
+            T.copy(a_ub, C)
+
+    return main
+
+
+@pytest.mark.parametrize(
+    "dtype,col",
+    [("float", 64), ("float", 128), ("float", 256), ("float16", 128), ("float16", 256)],
+)
+def test_exp_experiment(dtype, col):
+    # exp_experiment is ascendc-only (no PTO counterpart). It exps only the first
+    # `col` columns of a 512-wide N-strided buffer, in place, leaving [col:N] as-is
+    # -- what an online-softmax narrow window needs without compacting to a tile.
+    M, N = 16, 512
+    func = exp_experiment_kernel(M, N, col, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target="ascendc")
+
+    torch_dtype = torch.float16 if dtype == "float16" else torch.float32
+    a = torch.randn(M, N, dtype=torch_dtype).npu()
+    torch.npu.synchronize()
+
+    c = func(a)
+    torch.npu.synchronize()
+
+    ref = a.clone()
+    ref[:, :col] = torch.exp(a[:, :col])  # only the window is exp'd; tail unchanged
+
+    torch.testing.assert_close(c.cpu(), ref.cpu(), rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

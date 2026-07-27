@@ -1,7 +1,8 @@
 from __future__ import annotations
 import tilelang.language as T
-from tvm.tir import PrimExpr, Buffer, BufferRegion, BufferLoad, Call
-from tvm import tir
+from tvm.ir import Range
+from tvm.tir import PrimExpr, Buffer, BufferRegion, BufferLoad, Call, IntImm, Ramp
+from tvm import DataType, tir
 from tilelang.language.ascend import _dtype
 import functools
 import warnings
@@ -738,6 +739,61 @@ def brcb(dst: Buffer, src: Buffer, repeat_times: PrimExpr, dst_blk_stride: PrimE
     return T.call_extern("handle", f"tl::ascend::brcb<{_dtype(src)}>", dst_ptr, src_ptr, repeat_times, dst_blk_stride, dst_repeat_stride)
 
 
+def brcb_experiment(
+    dst: Buffer | BufferRegion | BufferLoad,
+    src: Buffer | BufferRegion | BufferLoad,
+    repeat_times: PrimExpr,
+    dst_blk_stride: PrimExpr,
+    dst_repeat_stride: PrimExpr,
+):
+    """Broadcast repeat copy block (BRCB) intrinsic with dual-backend support.
+
+    AscendC backend: emits ``tl::ascend::brcb<dtype>(dst, src, repeat, blk_stride, rep_stride)``.
+    PTO backend: emits ``TROWEXPAND(dst, src)`` (ignoring hardware stride params).
+
+    Args:
+        dst: Destination buffer. Start address must be 32-byte aligned.
+        src: Source buffer. Must contain at least ``repeat_times * 8`` elements.
+        repeat_times: Number of iterations. Each iteration fills 8 data blocks.
+        dst_blk_stride: Stride between data blocks within one iteration.
+        dst_repeat_stride: Stride between iterations for the same data block.
+
+    Returns:
+        A TVM intrinsic call for the BRCB operation.
+    """
+    if isinstance(dst, BufferRegion):
+        dst_ptr, _ = _handle_buffer_region(dst, "w")
+    else:
+        dst_ptr = dst.access_ptr("w")
+
+    if isinstance(src, BufferRegion):
+        src_ptr, src_extent = _handle_buffer_region(src, "r")
+    else:
+        src_ptr = src.access_ptr("r")
+        src_extent = src.shape
+
+    try:
+        repeat_times_value = int(repeat_times)
+    except (TypeError, ValueError):
+        repeat_times_value = None
+    if repeat_times_value is not None and all(isinstance(x, (int, IntImm)) for x in src_extent):
+        src_size = 1
+        for x in src_extent:
+            src_size *= int(x) if isinstance(x, IntImm) else x
+        assert src_size >= repeat_times_value * 8, "src size must be not less than repeat_times * 8"
+
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_brcb_experiment"),
+        f"brcb<{_dtype(src)}>",
+        dst_ptr,
+        src_ptr,
+        repeat_times,
+        dst_blk_stride,
+        dst_repeat_stride,
+    )
+
+
 def binary_op(
     dst: Buffer | BufferRegion,
     src0: Buffer | BufferRegion,
@@ -1386,9 +1442,36 @@ def transpose(dst: Buffer, src: Buffer):
     buffer into the destination buffer.
 
     Args:
-        dst: The destination buffer.
-        src: The source buffer to be transposed.
+        dst: The destination buffer, shape [W, H].
+        src: The source buffer to be transposed, shape [H, W].
+
+    Note:
+        H and W must satisfy 32-byte alignment (i.e., H * sizeof(dtype) and
+        W * sizeof(dtype) must be multiples of 32). For B16 (half/int16/uint16)
+        and B32 (float/int32/uint32), this means H and W must be multiples of
+        16; for int8, multiples of 32. Supports B16 and B32 via hardware
+        instruction; int8 and bfloat16 fall back to scalar implementation.
     """
+    src_shape = list(src.shape)
+    if len(src_shape) < 2:
+        raise ValueError(f"transpose requires a 2D source buffer. Got shape: {src_shape}")
+
+    elem_bytes = DataType(src.dtype).bits // 8
+    for axis_name, dim in [("H", src_shape[-2]), ("W", src_shape[-1])]:
+        if isinstance(dim, tir.IntImm):
+            val = dim.value
+        elif isinstance(dim, int):
+            val = dim
+        else:
+            raise ValueError(f"transpose requires src buffer with static shape (32-byte aligned). Found dynamic dimension: {dim}.")
+        if val * elem_bytes % 32 != 0:
+            raise ValueError(
+                f"transpose requires both H and W to satisfy 32-byte alignment "
+                f"(i.e., {axis_name} * sizeof({src.dtype}) must be a multiple of 32). "
+                f"Got src shape {src_shape}, {axis_name} = {val}, sizeof({src.dtype}) = {elem_bytes}, "
+                f"{val} * {elem_bytes} = {val * elem_bytes} is not a multiple of 32."
+            )
+
     return tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.ascend_transpose"),
@@ -2150,6 +2233,264 @@ def row_expand_mul(
         "handle",
         tir.op.Op.get("tl.ascend_row_expand_mul"),
         *args,
+    )
+
+
+def _buffer_load_to_buffer_region(load: BufferLoad) -> BufferRegion:
+    """Convert a contiguous buffer load to an equivalent BufferRegion."""
+    buf = load.buffer
+    indices = []
+    for idx in load.indices:
+        if isinstance(idx, Ramp):
+            base = idx.base
+            stride = idx.stride
+            lanes = idx.lanes
+            if isinstance(stride, IntImm):
+                stride_val = int(stride)
+            else:
+                stride_val = stride
+            if isinstance(base, IntImm):
+                base_val = int(base)
+            else:
+                base_val = base
+            extent = (lanes - 1) * stride_val + 1
+            indices.append(Range.from_min_extent(base_val, extent))
+        elif isinstance(idx, IntImm):
+            indices.append(Range.from_min_extent(int(idx), 1))
+        else:
+            indices.append(Range.from_min_extent(idx, 1))
+    return BufferRegion(buf, indices)
+
+
+def _normalize_buffer_arg(obj: Buffer | BufferRegion | BufferLoad) -> Buffer | BufferRegion:
+    """Normalize Buffer / BufferRegion / BufferLoad into Buffer or BufferRegion."""
+    if isinstance(obj, BufferLoad):
+        return _buffer_load_to_buffer_region(obj)
+    return obj
+
+
+def _is_const_one(val) -> bool:
+    """Check if a value is constant 1 (int or IntImm)."""
+    if isinstance(val, (int, float)):
+        return val == 1
+    if isinstance(val, IntImm):
+        return val.value == 1
+    return False
+
+
+def _const_equal(a, b) -> bool:
+    """Compare two values that may be int, IntImm, or symbolic PrimExpr."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, IntImm) and isinstance(b, IntImm):
+        return a.value == b.value
+    if isinstance(a, (int, float)) and isinstance(b, IntImm):
+        return a == b.value
+    if isinstance(a, IntImm) and isinstance(b, (int, float)):
+        return a.value == b
+    import tvm
+
+    return tvm.ir.structural_equal(a, b)
+
+
+def _shapes_equal(shape1, shape2) -> bool:
+    """Compare two shape lists that may contain symbolic PrimExpr."""
+    if len(shape1) != len(shape2):
+        return False
+    return all(_const_equal(x, y) for x, y in zip(shape1, shape2))
+
+
+def _row_expand_binop_experiment(
+    dst,
+    src0,
+    src1,
+    tmp,
+    op_name: str,
+    ir_op_name: str,
+    desc: str,
+):
+    dst = _normalize_buffer_arg(dst)
+    src0 = _normalize_buffer_arg(src0)
+    src1 = _normalize_buffer_arg(src1)
+    if tmp is not None:
+        tmp = _normalize_buffer_arg(tmp)
+
+    if isinstance(dst, BufferRegion):
+        dst_ptr, dst_shape = _handle_buffer_region_2d(dst, "w")
+    else:
+        dst_ptr = dst.access_ptr("w")
+        dst_shape = list(dst.shape[-2:])
+
+    if isinstance(src0, BufferRegion):
+        src0_ptr, src0_shape = _handle_buffer_region_2d(src0, "r")
+    else:
+        src0_ptr = src0.access_ptr("r")
+        src0_shape = list(src0.shape[-2:])
+
+    if isinstance(src1, BufferRegion):
+        src1_ptr, src1_nd_extent = _handle_buffer_region(src1, "r")
+        src1_full_shape = [src1_nd_extent[-1]] if len(src1_nd_extent) >= 2 else src1_nd_extent
+    else:
+        src1_ptr = src1.access_ptr("r")
+        src1_full_shape = list(src1.shape)
+
+    if len(src1_full_shape) == 1:
+        src1_len = src1_full_shape[0]
+    elif len(src1_full_shape) == 2:
+        s0, s1 = src1_full_shape[-2], src1_full_shape[-1]
+        if _is_const_one(s0):
+            src1_len = s1
+        elif _is_const_one(s1) or _const_equal(s0, dst_shape[0]):
+            src1_len = s0
+        else:
+            raise ValueError(f"src1 must be 1D [R], [1, R], or [R, 1]; got {src1_full_shape}")
+    else:
+        raise ValueError(f"src1 must be 1D or 2D, got shape {src1_full_shape}")
+
+    if len(dst_shape) != 2 or len(src0_shape) != 2:
+        raise ValueError(f"{op_name} requires 2D buffers for dst and src0.")
+
+    if not _shapes_equal(dst_shape, src0_shape):
+        raise ValueError(f"dst and src0 shapes must match: dst={dst_shape}, src0={src0_shape}")
+
+    if not _const_equal(src1_len, dst_shape[0]):
+        raise ValueError(f"src1 scalar count must match dst rows: src1={src1_len}, dst[0]={dst_shape[0]}")
+
+    dtype = _dtype(src0)
+    args = [
+        f"{op_name}<{dtype}>",
+        dst_ptr,
+        src0_ptr,
+        src1_ptr,
+    ]
+    if tmp is not None:
+        if isinstance(tmp, BufferRegion):
+            tmp_ptr, _ = _handle_buffer_region(tmp, "rw")
+        else:
+            tmp_ptr = tmp.access_ptr("rw")
+        args.append(tmp_ptr)
+
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get(ir_op_name),
+        *args,
+    )
+
+
+def row_expand_mul_experiment(
+    dst: Buffer | BufferRegion,
+    src0: Buffer | BufferRegion,
+    src1: Buffer | BufferRegion,
+    tmp: Buffer | BufferRegion | None = None,
+):
+    """Performs row-wise broadcast multiply: dst[i,j] = src0[i,j] * src1[i].
+
+    AscendC: brcb(src1→tmp) + mul_mask(dst, src0, tmp).
+    PTO: TROWEXPANDMUL_row_vec(dst, src0, src1).
+    """
+    return _row_expand_binop_experiment(
+        dst,
+        src0,
+        src1,
+        tmp,
+        "RowExpandMulExperiment",
+        "tl.ascend_row_expand_mul_experiment",
+        "multiply",
+    )
+
+
+def row_expand_sub_experiment(
+    dst: Buffer | BufferRegion,
+    src0: Buffer | BufferRegion,
+    src1: Buffer | BufferRegion,
+    tmp: Buffer | BufferRegion | None = None,
+):
+    """Performs row-wise broadcast subtract: dst[i,j] = src0[i,j] - src1[i].
+
+    AscendC: brcb(src1→tmp) + sub_mask(dst, src0, tmp).
+    PTO: TROWEXPANDSUB_row_vec(dst, src0, src1).
+    """
+    return _row_expand_binop_experiment(
+        dst,
+        src0,
+        src1,
+        tmp,
+        "RowExpandSubExperiment",
+        "tl.ascend_row_expand_sub_experiment",
+        "subtract",
+    )
+
+
+def row_expand_div_experiment(
+    dst: Buffer | BufferRegion,
+    src0: Buffer | BufferRegion,
+    src1: Buffer | BufferRegion,
+    tmp: Buffer | BufferRegion | None = None,
+):
+    """Performs row-wise broadcast divide: dst[i,j] = src0[i,j] / src1[i].
+
+    AscendC: brcb(src1→tmp) + div_mask(dst, src0, tmp).
+    PTO: TROWEXPANDDIV_row_vec(dst, src0, src1).
+    """
+    return _row_expand_binop_experiment(
+        dst,
+        src0,
+        src1,
+        tmp,
+        "RowExpandDivExperiment",
+        "tl.ascend_row_expand_div_experiment",
+        "divide",
+    )
+
+
+def exp_experiment(dst, src):
+    """Strided masked exp over a 64-column (fp32) chunk of a wider N-strided buffer.
+
+    Exps ``dst[i, 0:64] = exp(src[i, 0:64])`` for every row in one call, striding by
+    the buffer's physical column count (read from the declaration by
+    ExpExperimentCodegen) so it touches just the valid window of an [M, N]-strided
+    score buffer without compaction. Callers loop 64-column chunks over the valid
+    window (same shape row_expand_sub_experiment expects). Unary mirror of the
+    experiment row-ops: emits ``tl::ascend::exp_mask<dtype>(dst, src, ...)``.
+
+    Args:
+        dst: Destination [rows, chunk_cols] buffer region (chunk_cols = 64 for fp32).
+        src: Source buffer region of matching shape (may equal dst for in-place exp).
+    """
+    dst = _normalize_buffer_arg(dst)
+    src = _normalize_buffer_arg(src)
+
+    if isinstance(dst, BufferRegion):
+        dst_ptr, dst_shape = _handle_buffer_region_2d(dst, "w")
+    else:
+        dst_ptr = dst.access_ptr("w")
+        dst_shape = list(dst.shape[-2:])
+
+    if isinstance(src, BufferRegion):
+        src_ptr, src_shape = _handle_buffer_region_2d(src, "r")
+    else:
+        src_ptr = src.access_ptr("r")
+        src_shape = list(src.shape[-2:])
+
+    if len(dst_shape) != 2 or len(src_shape) != 2:
+        raise ValueError("exp_experiment requires 2D buffers for dst and src.")
+    if not _shapes_equal(dst_shape, src_shape):
+        raise ValueError(f"dst and src shapes must match: dst={dst_shape}, src={src_shape}")
+
+    dtype = _dtype(src)
+    if dtype not in ("float16", "half", "float32", "float"):
+        raise ValueError(f"exp_experiment only supports float16 or float32, got {dtype}")
+    expected_chunk = 128 if dtype in ("float16", "half") else 64
+    if not _const_equal(dst_shape[1], expected_chunk):
+        raise ValueError(
+            f"exp_experiment requires the chunk size (last dimension) to be exactly {expected_chunk} for {dtype}, but got {dst_shape[1]}."
+        )
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_exp_experiment"),
+        f"exp_mask<{dtype}>",
+        dst_ptr,
+        src_ptr,
     )
 
 

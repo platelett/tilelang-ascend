@@ -108,4 +108,3 @@ docs/notebook/*.cpp
 examples/gemm_aot/example_gemm.cpp
 examples/gemm_aot/kernel_lib.so
 examples/fused_sigmoid_gating_delta_rule/ascendc.cpp
-
