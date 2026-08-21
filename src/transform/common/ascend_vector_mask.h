@@ -22,6 +22,7 @@ using namespace tir;
 enum class SelectorRecipe : uint8_t {
   kAlways,
   kNaturalNormal,
+  kLegacyBitwiseCount,
   kCopyUbSameType,
   kReduceNarrow,
   kReduceHalfSum,
