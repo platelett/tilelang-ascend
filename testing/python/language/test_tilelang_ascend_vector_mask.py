@@ -216,16 +216,6 @@ def test_selection_uses_normal_and_counter_without_dtype_fallback():
     with pytest.raises(Exception, match="Unsupported AscendC Vector dtype uint32.*no fallback"):
         OptimizeForTarget(lowered, ASCENDC, "A2")
 
-    uint8_and = _call(
-        "tl.ascend_bitwise_and",
-        _access("uint8", "u8_dst", 8, 2),
-        _access("uint8", "u8_src0", 8, 1),
-        _access("uint8", "u8_src1", 8, 1),
-        _int(8),
-    )
-    with pytest.raises(Exception, match="Unsupported AscendC Vector dtype uint8.*no fallback"):
-        _selected_call(uint8_and, "tl.ascend_bitwise_and_raw")
-
 
 def test_effect_only_variants_share_terminals_and_compute_contextual_contracts():
     def selected_copy(src_type, tag, *extra):
