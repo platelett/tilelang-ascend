@@ -17,6 +17,7 @@ N = 16
 block_M = 2
 block_N = 16
 
+
 @tilelang.jit(
     out_idx=[-1],
     target="ascendc",
