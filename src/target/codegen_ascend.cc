@@ -477,34 +477,35 @@ void CodeGenTileLangAscend::VisitExpr_(const MinNode *op, std::ostream &os) {
 
 void CodeGenTileLangAscend::VisitExpr_(const BufferLoadNode *op,
                                        std::ostream &os) {
-  auto var_name = var_idmap_[op->buffer->data.get()];
   std::string scope = GetPtrStorageScope(op->buffer->data);
   if (scope == "local.var") {
-    os << var_name;
+    os << var_idmap_[op->buffer->data.get()];
   } else {
     // Flatten every index, not just the innermost one: a scalar access into a
     // multi-dimensional buffer such as table[b, i] otherwise drops the leading
     // dimensions and aliases every row onto row 0. OffsetOf is the identity for
     // a 1-D buffer, so single-dimension accesses are unchanged.
-    os << var_name << ".GetValue("
-       << PrintExpr(op->buffer.OffsetOf(op->indices).back()) << ")";
+    os << ResolveBufferObject(op->buffer->data.get(), op->buffer->dtype)
+       << ".GetValue(" << PrintExpr(op->buffer.OffsetOf(op->indices).back())
+       << ")";
   }
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
-  auto var_name = var_idmap_[op->buffer->data.get()];
   std::string scope = GetPtrStorageScope(op->buffer->data);
   if (scope == "local.var") {
     std::string value = PrintExpr(op->value);
     this->PrintIndent();
-    this->stream << var_name << " = " << value << ";\n";
+    this->stream << var_idmap_[op->buffer->data.get()] << " = " << value
+                 << ";\n";
   } else {
     // See VisitExpr_(BufferLoadNode): flatten across all dimensions.
     std::string index = PrintExpr(op->buffer.OffsetOf(op->indices).back());
     std::string value = PrintExpr(op->value);
     this->PrintIndent();
-    this->stream << var_name << ".SetValue(" << index << ", " << value
-                 << ");\n";
+    this->stream << ResolveBufferObject(op->buffer->data.get(),
+                                        op->buffer->dtype)
+                 << ".SetValue(" << index << ", " << value << ");\n";
   }
 }
 
@@ -598,8 +599,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     UseSwizzleCodegen(op, os);
   } else if (op->op.same_as(tl::ascend_mma())) {
     MmaCodegen(op);
-  } else if (op->op.same_as(tl::ascend_reinterpretcast())) {
-    ReinterpretCastCodegen(op);
   } else if (op->op.same_as(builtin::if_then_else())) {
     IfThenElseCodegen(op, os);
   } else {
@@ -856,13 +855,69 @@ void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
   ICHECK(this->para_.size() % 3 == 0)
       << "CodeGenTileLangAscend: parameters should be in pairs of (var, "
          "handle, dtype)";
+
+  global_typed_aliases_.clear();
+  auto register_global_alias = [this](const VarNode *buffer_var,
+                                      DataType logical_dtype) {
+    if (!global_buffer_vars_.count(buffer_var)) {
+      return;
+    }
+    auto storage_dtype_it = buffer_dtypes_.find(buffer_var);
+    ICHECK(storage_dtype_it != buffer_dtypes_.end());
+    if (storage_dtype_it->second == logical_dtype) {
+      return;
+    }
+    global_typed_aliases_[buffer_var].try_emplace(getType(logical_dtype), "");
+  };
+  tir::PostOrderVisit(f->body, [&](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      if (call->op.same_as(builtin::tvm_access_ptr()) &&
+          call->args.size() >= 2) {
+        register_global_alias(call->args[1].as<VarNode>(),
+                              GetAccessPtrDtype(call));
+      }
+      return;
+    }
+    if (const auto *load = node.as<BufferLoadNode>()) {
+      register_global_alias(load->buffer->data.get(), load->buffer->dtype);
+      return;
+    }
+    if (const auto *store = node.as<BufferStoreNode>()) {
+      register_global_alias(store->buffer->data.get(), store->buffer->dtype);
+    }
+  });
+
+  std::vector<const VarNode *> global_buffer_vars;
+  global_buffer_vars.reserve(f->params.size());
+  for (const Var &param : f->params) {
+    auto buffer_it = f->buffer_map.find(param);
+    if (buffer_it != f->buffer_map.end()) {
+      global_buffer_vars.push_back((*buffer_it).second->data.get());
+    }
+  }
+  ICHECK_EQ(global_buffer_vars.size(), this->para_.size() / 3);
+
   for (size_t i = 0; i < this->para_.size(); i += 3) {
+    const VarNode *buffer_var = global_buffer_vars[i / 3];
     this->PrintIndent();
     stream << "AscendC::GlobalTensor<" << this->para_[i + 2] << "> "
            << this->para_[i + 1] << ";\n";
     this->PrintIndent();
     stream << this->para_[i + 1] << ".SetGlobalBuffer((__gm__ "
            << this->para_[i + 2] << "*)" << this->para_[i] << ");\n";
+
+    auto alias_it = global_typed_aliases_.find(buffer_var);
+    if (alias_it == global_typed_aliases_.end()) {
+      continue;
+    }
+    for (auto &[type, alias_name] : alias_it->second) {
+      alias_name = name_supply_->FreshName(this->para_[i + 1] + "_view");
+      this->PrintIndent();
+      stream << "AscendC::GlobalTensor<" << type << "> " << alias_name << ";\n";
+      this->PrintIndent();
+      stream << alias_name << ".SetGlobalBuffer((__gm__ " << type << "*)"
+             << this->para_[i] << ");\n";
+    }
   }
   stream << "\n";
 
@@ -1105,8 +1160,10 @@ void CodeGenTileLangAscend::AddFunction(const GlobalVar &gvar,
   this->InitFuncState(f);
   current_resource_scope_ = -1;
   buffer_dtypes_.clear();
+  global_buffer_vars_.clear();
   for (const auto &entry : f->buffer_map) {
     buffer_dtypes_[entry.second->data.get()] = entry.second->dtype;
+    global_buffer_vars_.insert(entry.second->data.get());
   }
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
@@ -1232,24 +1289,40 @@ CodeGenTileLangAscend::PrintBufferOffset(const CallNode *call_arg_node,
                                          bool has_offset) {
   auto _var = call_arg_node->args[1].as<VarNode>();
   auto _var_offset = PrintExpr(call_arg_node->args[2]);
-  auto _var_name = var_idmap_[_var];
-  if (_var_name == "") {
-    _var_name = _var->name_hint;
-  }
-  // AscendStorageRewrite is allowed to reuse UB storage across buffers with
-  // different element types.  The access_ptr retains the consumer's logical
-  // dtype, while the single emitted LocalTensor has the allocation's dtype.
-  // Reinterpret before indexing so both the C++ type and offset units follow
-  // the access_ptr contract (not the aliased allocation's element type).
+  // One LocalTensor owns the allocation, while access_ptr retains the view's
+  // dtype. Reinterpret before indexing so offsets use that logical dtype.
   const DataType access_dtype = GetAccessPtrDtype(call_arg_node);
-  auto dtype_it = buffer_dtypes_.find(_var);
-  if (dtype_it != buffer_dtypes_.end() && dtype_it->second != access_dtype) {
-    _var_name += ".ReinterpretCast<" + getType(access_dtype) + ">()";
-  }
+  std::string _var_name = ResolveBufferObject(_var, access_dtype);
   if (has_offset) {
     return _var_name + "[" + _var_offset + "]";
   }
   return _var_name;
+}
+
+std::string
+CodeGenTileLangAscend::ResolveBufferObject(const VarNode *buffer_var,
+                                           DataType logical_dtype) {
+  std::string var_name = var_idmap_[buffer_var];
+  if (var_name.empty()) {
+    var_name = buffer_var->name_hint;
+  }
+
+  auto storage_dtype_it = buffer_dtypes_.find(buffer_var);
+  if (storage_dtype_it == buffer_dtypes_.end() ||
+      storage_dtype_it->second == logical_dtype) {
+    return var_name;
+  }
+
+  std::string type = getType(logical_dtype);
+  if (global_buffer_vars_.count(buffer_var)) {
+    auto alias_it = global_typed_aliases_.find(buffer_var);
+    ICHECK(alias_it != global_typed_aliases_.end() &&
+           alias_it->second.count(type))
+        << "Missing typed GlobalTensor alias for " << buffer_var->name_hint
+        << " with dtype " << logical_dtype;
+    return alias_it->second.at(type);
+  }
+  return var_name + ".ReinterpretCast<" + type + ">()";
 }
 
 void CodeGenTileLangAscend::AddDeclStream(std::ostringstream &ss,
@@ -2295,9 +2368,12 @@ void CodeGenTileLangAscend::GemmOpCodegen(const CallNode *op) {
   auto b_offset = PrintExpr(op->args[2].as<CallNode>()->args[2]);
   auto c_offset = PrintExpr(op->args[3].as<CallNode>()->args[2]);
 
-  auto a_name = var_idmap_[a_var];
-  auto b_name = var_idmap_[b_var];
-  auto c_name = var_idmap_[c_var];
+  auto a_name =
+      ResolveBufferObject(a_var, GetAccessPtrDtype(op->args[1].as<CallNode>()));
+  auto b_name =
+      ResolveBufferObject(b_var, GetAccessPtrDtype(op->args[2].as<CallNode>()));
+  auto c_name =
+      ResolveBufferObject(c_var, GetAccessPtrDtype(op->args[3].as<CallNode>()));
 
   this->stream << op_name << "(" << a_name << "[" << a_offset << "], " << b_name
                << "[" << b_offset << "], " << c_name << "[" << c_offset
@@ -2444,9 +2520,12 @@ void CodeGenTileLangAscend::MmaCodegen(const CallNode *op) {
   auto b_offset = PrintExpr(op->args[2].as<CallNode>()->args[2]);
   auto c_offset = PrintExpr(op->args[3].as<CallNode>()->args[2]);
 
-  auto a_name = var_idmap_[a_var];
-  auto b_name = var_idmap_[b_var];
-  auto c_name = var_idmap_[c_var];
+  auto a_name =
+      ResolveBufferObject(a_var, GetAccessPtrDtype(op->args[1].as<CallNode>()));
+  auto b_name =
+      ResolveBufferObject(b_var, GetAccessPtrDtype(op->args[2].as<CallNode>()));
+  auto c_name =
+      ResolveBufferObject(c_var, GetAccessPtrDtype(op->args[3].as<CallNode>()));
 
   this->PrintIndent();
   this->stream << op_name << "(" << a_name << "[" << a_offset << "]," << b_name
@@ -2597,21 +2676,6 @@ void CodeGenTileLangAscend::MulAddDstCodegen(const CallNode *op) {
   this->PrintIndent();
   this->stream << "AscendC::MulAddDst(" << dst << ", " << src0 << ", " << src1
                << ", " << count << ");\n";
-}
-
-void CodeGenTileLangAscend::ReinterpretCastCodegen(const CallNode *op) {
-  std::vector<std::string> var_names;
-  for (int i = 0; i < 2; i++) {
-    auto var_name = PrintBufferOffset(op->args[i].as<CallNode>(), false);
-    var_names.push_back(var_name);
-  }
-  this->PrintIndent();
-  this->stream << "AscendC::LocalTensor"
-               << "<" << Downcast<StringImm>(op->args[2])->value << "> "
-               << var_names[0] << " = " << var_names[1] << "."
-               << "ReinterpretCast"
-               << "<" << Downcast<StringImm>(op->args[2])->value << ">"
-               << "();\n";
 }
 
 void CodeGenTileLangAscend::CreateSubExperimentCodegen(

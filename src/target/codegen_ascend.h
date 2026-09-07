@@ -12,8 +12,10 @@
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 
+#include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "target/source/codegen_c.h"
 
@@ -69,6 +71,9 @@ public:
   void AddFunction(const GlobalVar &gvar, const PrimFunc &f);
 
 private:
+  std::string ResolveBufferObject(const VarNode *buffer_var,
+                                  DataType logical_dtype);
+
   std::string PrintBufferOffset(const CallNode *call_arg,
                                 bool has_offset = true);
 
@@ -208,8 +213,6 @@ private:
 
   void RoundCodegen(const CallNode *op, const std::string &op_name);
 
-  void ReinterpretCastCodegen(const CallNode *op);
-
   void CreateSubExperimentCodegen(const CallNode *op,
                                   const std::string &op_name);
 
@@ -287,6 +290,10 @@ private:
   Map<Var, Array<PrimExpr>> buffer_shapes_;
 
   std::unordered_map<const VarNode *, DataType> buffer_dtypes_;
+
+  std::unordered_set<const VarNode *> global_buffer_vars_;
+  std::unordered_map<const VarNode *, std::map<std::string, std::string>>
+      global_typed_aliases_;
 
   // The resource-scope verifier guarantees that selected Vector terminals
   // and mask setters only occur in an explicit AIV scope.

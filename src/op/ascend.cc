@@ -1410,11 +1410,6 @@ TIR_DEFINE_TL_BUILTIN(ascend_round)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_reinterpretcast)
-    .set_num_inputs(3)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-
 TIR_DEFINE_TL_BUILTIN(ascend_sub_experiment)
     .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",

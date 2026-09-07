@@ -65,6 +65,7 @@ ascend/compiler_managed_vector_mask
 :maxdepth: 1
 :caption: API Reference
 
+api_docs/T.view
 api/modules
 :::
 
