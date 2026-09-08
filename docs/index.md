@@ -59,6 +59,7 @@ language_ref/tilelibrary
 :caption: ASCEND COMPILER
 
 ascend/compiler_managed_vector_mask
+ascend/row_reduce
 :::
 
 :::{toctree}
