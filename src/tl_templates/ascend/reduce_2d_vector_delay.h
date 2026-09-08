@@ -2,11 +2,26 @@
 #include <cstdint>
 
 namespace reduce2d_v2::vector_delay {
-enum class Dependency : uint8_t { VcgCompleteToVectorRead, VcgPartialToVectorRead, M1CompleteBinaryToWholeReduce, StagedCopyToTailVcg, WholeReduceToMerge, DirectColumnToMerge, MergeToNextLevel };
+enum class Dependency : uint8_t {
+  VcgCompleteToVectorRead,
+  VcgPartialToVectorRead,
+  M1CompleteBinaryToWholeReduce,
+  StagedCopyToTailVcg,
+  WholeReduceToMerge,
+  DirectColumnToMerge,
+  MergeToNextLevel
+};
 enum class Unit : uint8_t { BackendStartSlots, DescriptorCredits, None };
 enum class WaitKind : uint8_t { None, RepeatZeroVcg, VectorBarrier };
-struct DelayInput { Dependency dependency{}; int32_t naturalDistance{}; };
-struct DelayRule { Unit unit{}; int32_t requiredDistance{}; bool hasNumericDelay{}; };
+struct DelayInput {
+  Dependency dependency{};
+  int32_t naturalDistance{};
+};
+struct DelayRule {
+  Unit unit{};
+  int32_t requiredDistance{};
+  bool hasNumericDelay{};
+};
 struct Delay {
   Dependency dependency{};
   DelayRule rule{};
@@ -16,20 +31,21 @@ struct Delay {
 constexpr uint32_t DivUp(uint32_t x, uint32_t y) { return (x + y - 1) / y; }
 constexpr DelayRule RuleFor(Dependency dependency) {
   switch (dependency) {
-    case Dependency::VcgCompleteToVectorRead:
-      return {Unit::BackendStartSlots, 14, true};
-    case Dependency::VcgPartialToVectorRead:
-      return {Unit::BackendStartSlots, 20, true};
-    case Dependency::M1CompleteBinaryToWholeReduce:
-      return {Unit::BackendStartSlots, 14, true};
-    case Dependency::StagedCopyToTailVcg:
-      return {Unit::DescriptorCredits, 9, true};
-    default:
-      return {Unit::None, 0, false};
+  case Dependency::VcgCompleteToVectorRead:
+    return {Unit::BackendStartSlots, 14, true};
+  case Dependency::VcgPartialToVectorRead:
+    return {Unit::BackendStartSlots, 20, true};
+  case Dependency::M1CompleteBinaryToWholeReduce:
+    return {Unit::BackendStartSlots, 14, true};
+  case Dependency::StagedCopyToTailVcg:
+    return {Unit::DescriptorCredits, 9, true};
+  default:
+    return {Unit::None, 0, false};
   }
 }
 constexpr uint32_t RepeatZeroDescriptors(Unit unit, int32_t remaining) {
-  if (remaining <= 0) return 0;
+  if (remaining <= 0)
+    return 0;
   if (unit == Unit::BackendStartSlots)
     return remaining <= 4 ? 1U : static_cast<uint32_t>(remaining - 4);
   return static_cast<uint32_t>(remaining);
@@ -47,8 +63,7 @@ constexpr Delay CalculateDelay(Dependency dependency, int32_t naturalDistance) {
 constexpr Delay CalculateDelay(DelayInput input) {
   return CalculateDelay(input.dependency, input.naturalDistance);
 }
-template <Dependency D, int32_t Natural>
-struct StaticDelay {
+template <Dependency D, int32_t Natural> struct StaticDelay {
   inline static constexpr Delay value = CalculateDelay(D, Natural);
 };
 constexpr Dependency VcgWriteDependency(bool complete) {
@@ -60,7 +75,9 @@ constexpr DelayInput M1RecursiveInput(bool completeWrite,
   return {VcgWriteDependency(completeWrite),
           static_cast<int32_t>(DivUp(nextLogical, 64))};
 }
-struct M1TwoBinarySchedule { uint32_t betweenBinaryReductions{}, beforeWholeReduce{}; };
+struct M1TwoBinarySchedule {
+  uint32_t betweenBinaryReductions{}, beforeWholeReduce{};
+};
 constexpr int32_t EmptyRunDistance(uint32_t interveningDescriptors,
                                    uint32_t emptyRuns) {
   return static_cast<int32_t>(interveningDescriptors + 1 + 4 * emptyRuns);
@@ -106,4 +123,4 @@ constexpr WaitKind ChooseWait(Delay delay, bool allowRepeatZero) {
              : (delay.remainingDistance == 0 ? WaitKind::None
                                              : WaitKind::RepeatZeroVcg);
 }
-}  // namespace reduce2d_v2::vector_delay
+} // namespace reduce2d_v2::vector_delay

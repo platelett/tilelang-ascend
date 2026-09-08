@@ -671,12 +671,11 @@ reduce_min(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
 
 // Expose the helper's Vector pipe to BiSheng automatic synchronization.
 #pragma begin_pipe(V)
-template <typename T, reduce2d_v2::Reduce2DKind Kind, bool Clear,
-          uint32_t M, uint32_t N, int32_t Dim, uint32_t PhysicalRow,
-          bool AllowRepeatZero>
+template <typename T, reduce2d_v2::Reduce2DKind Kind, bool Clear, uint32_t M,
+          uint32_t N, int32_t Dim, uint32_t PhysicalRow, bool AllowRepeatZero>
 CATLASS_DEVICE void reduce_2d(LocalTensor<T> const &dstTensor,
-                            LocalTensor<T> const &srcTensor,
-                            LocalTensor<T> const &sharedTmpBuffer) {
+                              LocalTensor<T> const &srcTensor,
+                              LocalTensor<T> const &sharedTmpBuffer) {
   static_assert(std::is_same_v<T, float> && Dim == -1,
                 "Reduce2D v2 only supports fp32 row reduction");
   reduce2d_v2::Reduce2D<T, Kind, Clear, M, N, PhysicalRow, AllowRepeatZero>(

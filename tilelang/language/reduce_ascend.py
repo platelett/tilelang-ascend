@@ -283,10 +283,7 @@ def reduce(
     """Emit the Ascend fast-path reduce intrinsic for buffers or buffer regions."""
     dtype = _dtype(buffer)
     if dtype == "float" and dim == -1 and _dtype(out) != dtype:
-        raise TypeError(
-            "Ascend row reduce source and destination dtypes must match, "
-            f"got {dtype} and {_dtype(out)}"
-        )
+        raise TypeError(f"Ascend row reduce source and destination dtypes must match, got {dtype} and {_dtype(out)}")
 
     def _handle_buffer_region(br: BufferRegion, mask):
         bf = br.buffer
