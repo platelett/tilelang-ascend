@@ -21,6 +21,7 @@
 #include <tvm/tir/transform.h>
 
 #include "../op/ascend.h"
+#include "../tl_templates/ascend/reduce_2d_v2.h"
 #include "common/ascend_vector_mask.h"
 
 namespace tvm {
@@ -375,11 +376,13 @@ void ValidateSemanticAbi(const ResolvedSemanticCall &resolved,
     return;
   case AbiRecipe::kReduce: {
     ReduceCallLayout layout = ParseReduceCallLayout(args, variant.name);
-    ICHECK_EQ(variant.selector == SelectorRecipe::kReduceNarrow,
-              layout.has_physical_row)
-        << malformed
-        << "physical-row presence does not match the selected "
-           "reduce variant";
+    if (variant.selector != SelectorRecipe::kReduceFp32V2) {
+      ICHECK_EQ(variant.selector == SelectorRecipe::kReduceNarrow,
+                layout.has_physical_row)
+          << malformed
+          << "physical-row presence does not match the selected "
+             "reduce variant";
+    }
     return;
   }
   case AbiRecipe::kBroadcast: {
@@ -558,6 +561,24 @@ ResolveSemanticCall(const Call &call,
     ICHECK_EQ(params.size(), 4U);
     ReduceCallLayout layout =
         ParseReduceCallLayout(call->args, semantic.base->name.c_str());
+    if (params[0] == "float" && params[3] == "-1") {
+      const int64_t m = std::stoll(params[1]);
+      const int64_t n = std::stoll(params[2]);
+      const auto *clear = call->args[layout.clear_index].as<IntImmNode>();
+      ICHECK(clear != nullptr && clear->dtype.is_bool())
+          << "fp32 Reduce2D clear must be static";
+      const int64_t row_pitch =
+          layout.has_physical_row ? Downcast<IntImm>(call->args.back())->value
+                                  : (n + 7) / 8 * 8;
+      ICHECK_GT(reduce2d_v2::Reduce2DScratchElements(
+                    static_cast<uint32_t>(m), static_cast<uint32_t>(n),
+                    static_cast<uint32_t>(row_pitch), clear->value != 0),
+                0U)
+          << "No legal fp32 Reduce2D v2 plan for M=" << m << ", N=" << n
+          << ", physical_row=" << row_pitch;
+      variant = FindVariant(semantic, SelectorRecipe::kReduceFp32V2);
+      break;
+    }
     bool physical_row = layout.has_physical_row;
     SelectorRecipe recipe = physical_row ? SelectorRecipe::kReduceNarrow
                                          : SelectorRecipe::kReduceComposite;

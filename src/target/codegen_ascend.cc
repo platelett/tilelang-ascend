@@ -1754,6 +1754,48 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
 
   this->PrintIndent();
 
+  if (op->op.same_as(tl::ascend_reduce_fp32_v2())) {
+    const std::string tag = Downcast<StringImm>(op->args[0])->value;
+    const size_t left = tag.find('<');
+    const size_t right = tag.rfind('>');
+    ICHECK(left != std::string::npos && right != std::string::npos && left < right)
+        << "Malformed Ascend reduce tag: " << tag;
+    std::vector<std::string> params;
+    std::stringstream parser(tag.substr(left + 1, right - left - 1));
+    std::string param;
+    while (std::getline(parser, param, ',')) {
+      const size_t begin = param.find_first_not_of(" \t");
+      const size_t end = param.find_last_not_of(" \t");
+      ICHECK(begin != std::string::npos) << "Empty Ascend reduce parameter";
+      params.push_back(param.substr(begin, end - begin + 1));
+    }
+    ICHECK_EQ(params.size(), 4U);
+    ICHECK(params[0] == "float" && params[3] == "-1")
+        << "Reduce2D v2 terminal requires fp32 row reduction";
+    ICHECK_EQ(var_names.size(), 3U)
+        << "fp32 Reduce2D requires compiler-provided scratch";
+    const int64_t n = std::stoll(params[2]);
+    if (physical_row == 0) {
+      physical_row = (n + 7) / 8 * 8;
+    }
+    ICHECK_GE(physical_row, n);
+    ICHECK_EQ(physical_row % 8, 0)
+        << "fp32 Reduce2D physical row must be 32-byte aligned";
+    const std::string kind_name = tag.substr(0, left);
+    ICHECK(kind_name == "reduce_sum" || kind_name == "reduce_max" ||
+           kind_name == "reduce_min");
+    const char *kind = kind_name == "reduce_sum"   ? "kSum"
+                       : kind_name == "reduce_max" ? "kMax"
+                                                    : "kMin";
+    this->stream << "tl::ascend::reduce_2d<float, reduce2d_v2::Reduce2DKind::"
+                 << kind << ", " << clear_str << ", " << params[1] << ", "
+                 << n << ", -1, " << physical_row << ", "
+                 << (platform_ == "A3" ? "true" : "false") << ">(";
+    this->stream << var_names[0] << ", " << var_names[1] << ", "
+                 << var_names[2] << ");\n";
+    return;
+  }
+
   // Narrow row-reduce: the logical width is only part of a wider physical row,
   // so the source cannot be walked as one contiguous M x N block. Route to the
   // WholeReduce* helpers, which take an explicit per-repeat source stride.

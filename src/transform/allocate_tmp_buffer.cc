@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "../op/ascend.h"
+#include "../tl_templates/ascend/reduce_2d_v2.h"
 #include "common/operation_config.h"
 
 namespace tvm {
@@ -390,6 +391,13 @@ int64_t EstimatePTOReduceWorkspaceBytes(const CallNode *call,
 
 bool AscendCReduceUsesTmp(const CallNode *call) {
   const ReduceCallLayout layout = ParseReduceCallLayout(call);
+  const ReduceTemplateInfo info = ParseReduceTemplateInfo(call);
+  if (info.kind == ReduceKind::kSum || info.kind == ReduceKind::kMax ||
+      info.kind == ReduceKind::kMin) {
+    if (info.dtype == "float" && info.direction == -1) {
+      return true;
+    }
+  }
   if (layout.physical_row > 0) {
     return false;
   }
@@ -408,6 +416,20 @@ EstimateAscendCReduceWorkspaceBytes(const CallNode *call,
   }
 
   const ReduceTemplateInfo info = ParseReduceTemplateInfo(call);
+  const ReduceCallLayout layout = ParseReduceCallLayout(call);
+  if (info.dtype == "float" && info.direction == -1) {
+    const uint32_t physical_row = static_cast<uint32_t>(
+        layout.physical_row > 0 ? layout.physical_row
+                                : AlignUp(info.cols, int64_t{8}));
+    const uint32_t elements = reduce2d_v2::Reduce2DScratchElements(
+        static_cast<uint32_t>(info.rows), static_cast<uint32_t>(info.cols),
+        physical_row, layout.clear);
+    ICHECK_GT(elements, 0U)
+        << "fp32 Reduce2D plan is illegal for M=" << info.rows
+        << ", N=" << info.cols << ", physical_row=" << physical_row
+        << ", clear=" << layout.clear;
+    return static_cast<int64_t>(elements) * sizeof(float);
+  }
   const CallNode *src_access_ptr = AsAccessPtr(call->args[2]);
   const auto *src_var = src_access_ptr->args[1].as<VarNode>();
   ICHECK(src_var) << "Expected reduce source data variable.";
@@ -635,8 +657,14 @@ WorkspaceSpec GetAscendCWorkspaceSpec(const CallNode *call,
     if (!AscendCReduceUsesTmp(call)) {
       return NoWorkspace();
     }
+    const ReduceTemplateInfo info = ParseReduceTemplateInfo(call);
+    const DataType workspace_dtype =
+        info.dtype == "float" && info.direction == -1
+            ? DataType::Float(32)
+            : byte_dtype;
     return RequireWorkspace(
-        byte_dtype, EstimateAscendCReduceWorkspaceBytes(call, alloc_buffers));
+        workspace_dtype,
+        EstimateAscendCReduceWorkspaceBytes(call, alloc_buffers));
   }
   if (call->op.same_as(tl::ascend_broadcast())) {
     const int64_t bytes = EstimateAscendCBroadcastWorkspaceBytes(call);
@@ -902,6 +930,14 @@ private:
     // non-empty arena. PTO reduce(clear=False), in contrast, has a
     // TileLang-owned layout whose main/output views are derived here.
     if (target_ != "pto") {
+      const ReduceTemplateInfo info = ParseReduceTemplateInfo(op);
+      if (info.dtype == "float" && info.direction == -1) {
+        ICHECK_GE(GetAccessPtrBytes(op->args[tmp_buffer_param_offset]),
+                  spec.primary_bytes)
+            << "fp32 Reduce2D explicit tmp arena is too small: got "
+            << GetAccessPtrBytes(op->args[tmp_buffer_param_offset])
+            << " bytes, need " << spec.primary_bytes;
+      }
       return ReplaceWorkspace(
           op, tmp_buffer_param_offset,
           RetypeWorkspace(op->args[tmp_buffer_param_offset], spec));

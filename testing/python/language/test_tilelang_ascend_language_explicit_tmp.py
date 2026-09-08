@@ -874,10 +874,14 @@ def test_explicit_arena_capacity_contract():
     assert int(pto_call.args[4].args[2]) == 256
     assert int(pto_call.args[4].args[3]) == 32
 
-    ascendc_func = _inject(_reduce_program(1), "ascendc")
+    ascendc_func = _inject(_reduce_program(1120), "ascendc")
     ascendc_call = _collect_calls(ascendc_func, "tl.ascend_reduce")[0]
     assert ascendc_call.args[3].args[1].name == "arena_ub"
-    assert int(ascendc_call.args[3].args[3]) == 1
+    assert ascendc_call.args[3].args[0].dtype == "float32"
+    assert int(ascendc_call.args[3].args[3]) == 280
+
+    with pytest.raises(tvm.error.TVMError, match=r"too small.*1119 bytes.*need 1120"):
+        _inject(_reduce_program(1119), "ascendc")
 
     for model in ["ascendc", "pto"]:
         with pytest.raises(tvm.error.TVMError, match=r"is empty.*non-empty workspace"):
@@ -968,10 +972,15 @@ def test_reduce_zero_workspace_paths_elide_explicit_and_implicit_tmp():
 
     # narrow-row reduce keeps the WholeReduce* zero-workspace path.
     for arena_bytes in [0, None]:
-        reduced = _inject(_reduce_program(arena_bytes, real_shape=[4, 4]), "ascendc")
+        reduced = _inject(_reduce_program(arena_bytes, dtype="float16", real_shape=[4, 4]), "ascendc")
         reduce_call = _collect_calls(reduced, "tl.ascend_reduce")[0]
         assert not any(isinstance(arg, tir.Call) and arg.op.name == "tir.tvm_access_ptr" for arg in reduce_call.args[3:]), (arena_bytes,)
         assert "tmp_ub" not in _allocated_buffer_names(reduced), (arena_bytes,)
+
+    narrow = _inject(_reduce_program(None, real_shape=[4, 4]), "ascendc")
+    narrow_call = _collect_calls(narrow, "tl.ascend_reduce")[0]
+    assert narrow_call.args[3].args[0].dtype == "float32"
+    assert int(narrow_call.args[3].args[3]) > 0
 
 
 def test_ascendc_half_sum_reduce_needs_widen_workspace():
@@ -988,14 +997,14 @@ def test_ascendc_half_sum_reduce_needs_widen_workspace():
 @pytest.mark.parametrize(
     ("op", "shape", "dim", "expected_bytes"),
     [
-        ("sum", (8, 64), -1, 32),
-        ("sum", (8, 256), -1, 4096),
+        ("sum", (8, 64), -1, 1120),
+        ("sum", (8, 256), -1, 4192),
         ("max", (8, 32), -1, 256),
-        ("max", (8, 64), -1, 2048),
+        ("max", (8, 64), -1, 1120),
         ("sum", (8, 64), 0, 1024),
     ],
 )
-def test_ascendc_implicit_reduce_uses_transitional_heuristic(
+def test_ascendc_implicit_reduce_uses_v2_or_fallback_workspace(
     op,
     shape,
     dim,
@@ -1005,7 +1014,10 @@ def test_ascendc_implicit_reduce_uses_transitional_heuristic(
     call = _collect_calls(func, "tl.ascend_reduce")[0]
 
     assert call.args[3].args[1].name == "tmp_ub"
-    assert int(call.args[3].args[3]) == expected_bytes
+    view_dtype = call.args[3].args[0].dtype
+    assert int(call.args[3].args[3]) * tvm.DataType(view_dtype).itemsize() == expected_bytes
+    if dim == -1:
+        assert view_dtype == "float32"
 
 
 @pytest.mark.parametrize(

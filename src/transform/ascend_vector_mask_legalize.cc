@@ -241,6 +241,14 @@ MaskContract ContractOf(const Call &call, arith::Analyzer *analyzer) {
     contract.lo.ensure = MaskEnsure::kUnknown;
     contract.hi.ensure = MaskEnsure::kUnknown;
     return contract;
+  case ContractRecipe::kNormalFullToNormalFull:
+    contract = NormalFullRequirement(dtype);
+    contract.mode.ensure = MaskEnsure::kExact;
+    contract.mode.ensured = ModeValue(AscendMaskMode::kNormal);
+    contract.lo.ensure = MaskEnsure::kExact;
+    contract.lo.ensured = FullPayload();
+    contract.hi = AnyExact(FullPayload());
+    return contract;
   case ContractRecipe::kSelfContainedNormalFull:
     return NormalFullPostState();
   case ContractRecipe::kSelfContainedNormalExplicit: {

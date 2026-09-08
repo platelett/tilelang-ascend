@@ -142,6 +142,8 @@ TL_ASCEND_SEMANTIC_OP(ascend_reduce, "", 4, 6, kReduce)
 TL_ASCEND_PHYSICAL(ascend_reduce_narrow_raw_normal, kReduceNarrow,
                    kFloat16Float32, kReduce, kMask, kRawReduce,
                    "tl::ascend::reduce_narrow")
+TL_ASCEND_HELPER(ascend_reduce_fp32_v2, kReduceFp32V2,
+                 kNormalFullToNormalFull)
 TL_ASCEND_HELPER(ascend_reduce_advanced_composite, kReduceComposite,
                  kCompositeNormalFullUnknown)
 
