@@ -1758,7 +1758,8 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
     const std::string tag = Downcast<StringImm>(op->args[0])->value;
     const size_t left = tag.find('<');
     const size_t right = tag.rfind('>');
-    ICHECK(left != std::string::npos && right != std::string::npos && left < right)
+    ICHECK(left != std::string::npos && right != std::string::npos &&
+           left < right)
         << "Malformed Ascend reduce tag: " << tag;
     std::vector<std::string> params;
     std::stringstream parser(tag.substr(left + 1, right - left - 1));
@@ -1786,13 +1787,13 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
            kind_name == "reduce_min");
     const char *kind = kind_name == "reduce_sum"   ? "kSum"
                        : kind_name == "reduce_max" ? "kMax"
-                                                    : "kMin";
+                                                   : "kMin";
     this->stream << "tl::ascend::reduce_2d<float, reduce2d_v2::Reduce2DKind::"
-                 << kind << ", " << clear_str << ", " << params[1] << ", "
-                 << n << ", -1, " << physical_row << ", "
+                 << kind << ", " << clear_str << ", " << params[1] << ", " << n
+                 << ", -1, " << physical_row << ", "
                  << (platform_ == "A3" ? "true" : "false") << ">(";
-    this->stream << var_names[0] << ", " << var_names[1] << ", "
-                 << var_names[2] << ");\n";
+    this->stream << var_names[0] << ", " << var_names[1] << ", " << var_names[2]
+                 << ");\n";
     return;
   }
 

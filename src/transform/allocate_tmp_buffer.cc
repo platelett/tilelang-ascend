@@ -659,9 +659,8 @@ WorkspaceSpec GetAscendCWorkspaceSpec(const CallNode *call,
     }
     const ReduceTemplateInfo info = ParseReduceTemplateInfo(call);
     const DataType workspace_dtype =
-        info.dtype == "float" && info.direction == -1
-            ? DataType::Float(32)
-            : byte_dtype;
+        info.dtype == "float" && info.direction == -1 ? DataType::Float(32)
+                                                      : byte_dtype;
     return RequireWorkspace(
         workspace_dtype,
         EstimateAscendCReduceWorkspaceBytes(call, alloc_buffers));
