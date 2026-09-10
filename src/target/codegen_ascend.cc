@@ -1775,13 +1775,14 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
         << "Reduce2D v2 terminal requires fp32 row reduction";
     ICHECK_EQ(var_names.size(), 3U)
         << "fp32 Reduce2D requires compiler-provided scratch";
+    const int64_t m = std::stoll(params[1]);
     const int64_t n = std::stoll(params[2]);
     if (physical_row == 0) {
-      physical_row = (n + 7) / 8 * 8;
+      physical_row = n;
     }
     ICHECK_GE(physical_row, n);
-    ICHECK_EQ(physical_row % 8, 0)
-        << "fp32 Reduce2D physical row must be 32-byte aligned";
+    ICHECK(m == 1 || physical_row % 8 == 0)
+        << "fp32 Reduce2D physical row must be 32-byte aligned when M > 1";
     const std::string kind_name = tag.substr(0, left);
     ICHECK(kind_name == "reduce_sum" || kind_name == "reduce_max" ||
            kind_name == "reduce_min");

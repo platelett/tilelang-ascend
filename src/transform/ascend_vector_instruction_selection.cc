@@ -569,7 +569,9 @@ ResolveSemanticCall(const Call &call,
           << "fp32 Reduce2D clear must be static";
       const int64_t row_pitch = layout.has_physical_row
                                     ? Downcast<IntImm>(call->args.back())->value
-                                    : (n + 7) / 8 * 8;
+                                    : n;
+      ICHECK(m == 1 || row_pitch % 8 == 0)
+          << "fp32 Reduce2D physical row must be 32-byte aligned when M > 1";
       ICHECK_GT(reduce2d_v2::Reduce2DScratchElements(
                     static_cast<uint32_t>(m), static_cast<uint32_t>(n),
                     static_cast<uint32_t>(row_pitch), clear->value != 0),

@@ -270,7 +270,8 @@ constexpr Layout Place(uint32_t m, const Plan &plan) {
 constexpr bool Fits(uint32_t m, uint32_t srcRowStride, const Plan &plan) {
   if (!plan.legal)
     return false;
-  return uint64_t{m} * srcRowStride + AlignUp(m, 8) + Place(m, plan).elements <=
+  return uint64_t{m} * AlignUp(srcRowStride, 8) + AlignUp(m, 8) +
+             Place(m, plan).elements <=
          kUbElements;
 }
 constexpr Plan Select(uint32_t m, uint32_t srcRowStride, uint32_t logical,
@@ -332,13 +333,13 @@ template <uint32_t M, uint32_t N, uint32_t SrcRowStride, bool Clear,
           bool Product = false>
 struct GeneralTraits {
   static_assert(M > 0 && N > 0);
-  static_assert(SrcRowStride >= N && SrcRowStride % 8 == 0);
+  static_assert(SrcRowStride >= N && (M == 1 || SrcRowStride % 8 == 0));
   inline static constexpr uint32_t kM = M;
   inline static constexpr Plan plan = [] {
     if constexpr (Product)
-      return SelectProduct(M, SrcRowStride, N, SrcRowStride / 8, !Clear);
+      return SelectProduct(M, SrcRowStride, N, DivUp(SrcRowStride, 8), !Clear);
     else
-      return Select(M, SrcRowStride, N, SrcRowStride / 8, !Clear);
+      return Select(M, SrcRowStride, N, DivUp(SrcRowStride, 8), !Clear);
   }();
   static_assert(plan.legal && plan.count < kMaxSteps && BankSafe(plan));
   inline static constexpr Layout layout = Place(M, plan);
@@ -392,9 +393,9 @@ constexpr uint32_t Reduce2DScratchElements() {
 }
 constexpr uint32_t Reduce2DScratchElements(uint32_t m, uint32_t n, uint32_t s,
                                            bool clear) {
-  if (!m || !n || s < n || s % 8 || uint64_t{m} * s >= kUbElements)
+  if (!m || !n || s < n || (m > 1 && s % 8) || uint64_t{m} * s >= kUbElements)
     return 0;
-  const Plan p = SelectProduct(m, s, n, s / 8, !clear);
+  const Plan p = SelectProduct(m, s, n, DivUp(s, 8), !clear);
   return p.legal && BankSafe(p) ? Place(m, p).elements : 0;
 }
 #if defined(__CCE__)

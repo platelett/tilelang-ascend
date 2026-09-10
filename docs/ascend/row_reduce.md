@@ -1,9 +1,9 @@
 # Static FP32 row reductions
 
-The AscendC backend uses a header-only C++17 implementation for static FP32
+On A2/A3, AscendC uses a header-only C++17 implementation for static FP32
 `T.reduce_sum`, `T.reduce_max`, and `T.reduce_min` over the last dimension.
 These operations produce one result per row; they do not reduce the row count
-to produce one result per column. PTO, FP16, and other reduction axes retain
+to produce one result per column. A5, PTO, FP16, and other reduction axes retain
 their existing implementations.
 
 ## Logical width and physical pitch
@@ -13,10 +13,11 @@ participating values per row, and `S` is the physical distance between row
 starts, in FP32 elements. All three must be compile-time constants:
 
 ```text
-M > 0, N > 0, S >= N, S % 8 == 0
+M > 0, N > 0, S >= N, M == 1 or S % 8 == 0
 ```
 
-`N` need not be divisible by eight. Use `real_shape` to exclude padding:
+Unaligned multirow inputs fail during lowering. `N` need not be divisible by
+eight: use `real_shape` to exclude padding already present in the source:
 
 ```python
 src = T.alloc_ub((31, 96), "float32")
@@ -36,7 +37,7 @@ Prefer complete UB buffers. Source, destination, and scratch must have
 
 | Buffer | Required FP32 elements | Access |
 | --- | ---: | --- |
-| Source | `M * S` | Read-only |
+| Source | `AlignUp(M * S, 8)` | Read-only |
 | Destination | `AlignUp(M, 8)` | Writable, including padding |
 | Scratch | Shared planner's reported requirement | Fully clobberable |
 
@@ -44,10 +45,9 @@ The logical destination contains only `M` results. A source padding block may
 be read to form an intermediate result, but that result cannot contribute to
 the logical reduction. Invalid lanes of the last logical block are masked.
 
-An ordinary UB allocation receives physical alignment and padding from memory
-planning. An embedded buffer region additionally requires the caller to prove
-base alignment, ownership of destination padding, and absence of aliases;
-region construction alone does not establish those properties.
+Memory planning aligns allocation bases and total spans; it does not pad
+individual source rows. Embedded regions require the caller to prove base
+alignment, ownership of destination padding, and absence of aliases.
 
 Omit `tmp` for automatic allocation. An explicit `tmp` must be a static,
 contiguous, one-dimensional UB arena with enough bytes and an aligned start.

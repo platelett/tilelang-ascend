@@ -113,6 +113,22 @@ def test_fp32_row_frontend_uses_backing_shape_and_checks_dtype():
         T.reduce_sum(row, half_scalar)
 
 
+@pytest.mark.parametrize("logical_width", [10, 9])
+def test_fp32_row_reduce_rejects_unaligned_multirow_pitch(logical_width):
+    func = _kernel(2, logical_width, 10, "float32", "sum", True)
+    with pytest.raises(tvm.error.InternalError, match="physical row must be 32-byte aligned when M > 1"):
+        _source(func, "ascendc")
+
+
+def test_fp32_row_reduce_allows_unaligned_single_row():
+    func = _kernel(1, 10, 10, "float32", "sum", True)
+    source = _source(func, "ascendc")
+    assert ", 1, 10, -1, 10, true>(" in source
+    compiled = tilelang.compile(func, out_idx=[1], target="ascendc", pass_configs=PASS_CONFIGS)
+    host = torch.arange(10, dtype=torch.float32).reshape(1, 10)
+    torch.testing.assert_close(compiled(host.npu()).cpu(), host.sum(dim=1), rtol=0, atol=0)
+
+
 def test_fp32_reduce2d_v2_runtime_smoke():
     """One launch protects M/N tails, poisoned padding, and destination merge."""
     m, n, physical_row = 31, 95, 96
@@ -159,6 +175,13 @@ def test_codegen_selects_v2_kinds_and_preserves_other_backends():
 
     default = _source(_kernel(8, 32, 32, "float32", "max", True))
     assert "tl::ascend::reduce_2d<float" in default
+
+    a5 = _source(_kernel(8, 32, 32, "float32", "sum", True), "ascendc", platform="A5")
+    assert "tl::ascend::reduce_sum<float" in a5
+    assert "tmp_ub.ReinterpretCast<float>" not in a5
+    narrow_a5 = _source(_kernel(8, 9, 16, "float32", "max", True), "ascendc", platform="A5")
+    assert "tl::ascend::reduce_max_narrow<float>" in narrow_a5
+    assert "tmp_ub" not in narrow_a5
 
 
 def test_fp32_reduce2d_v2_uses_barriers_on_a2():
