@@ -6,8 +6,7 @@ TileLang offers two public entry points:
 - `@tilelang.jit(...)` compiles the program returned by a Python kernel factory.
 
 Both entry points accept `pass_configs` for TileLang compiler passes and
-`compile_flags` for extra Bisheng command-line options. They solve different
-problems: a Bisheng flag does not enable or disable a TileLang pass.
+`compile_flags` for extra Bisheng command-line options.
 
 ## Kernel-scoped Bisheng flags
 
@@ -23,33 +22,37 @@ def build_kernel(M, N):
     ...
 ```
 
-The same option is available without the decorator:
+Without the decorator:
 
 ```python
 kernel = tilelang.compile(program, target="ascendc", compile_flags=["-O3"])
 ```
 
-Flags are resolved separately for each kernel and are included in the kernel
-cache key. TileLang emits its derived defaults first, then appends the explicit
-flags. Bisheng uses the last repeated option: when the derived AscendC flags
-contain `-O2`, the explicit `-O3` above appears later and wins.
+Flags are resolved per kernel and included in its cache key. TileLang derives
+Bisheng defaults from `pass_configs`, applies supported legacy environment
+overrides, then appends explicit `compile_flags`. For optimization level and
+auto-sync, explicit flags override the defaults because Bisheng uses the last value.
+`pass_configs` still controls which TileLang passes run.
 
-The legacy `TL_CCE_AUTO_SYNC`, `TL_CCE_OPT_LEVEL`, and `TL_PTO_DEBUG`
-environment variables remain target-specific, read-only fallbacks on the
-backends that support them; `TL_PTO_DEBUG` affects only `target="pto"`.
-Compiling one kernel never rewrites the process environment or changes the
-defaults of a later kernel. Prefer `compile_flags` when an option belongs to
-one kernel.
+The legacy variables are `TL_CCE_AUTO_SYNC`, `TL_CCE_OPT_LEVEL`, and
+`TL_PTO_DEBUG`; the last affects only `target="pto"`. They are read-only:
+compiling a kernel does not change the process environment or later kernels'
+defaults. Prefer `compile_flags` for per-kernel options.
 
 ## Synchronization and debugging
 
-Disabling Bisheng automatic synchronization is safe only when the TileLang
-program or compiler passes already express every required dependency. Keep the
-TileLang synchronization pass in `pass_configs`; use `--cce-auto-sync=off` only
-to control the later Bisheng stage.
+For `target="ascendc"`, setting `TL_ASCEND_AUTO_SYNC_VS=True` in `pass_configs`
+enables the TileLang VS synchronization pass and defaults Bisheng to
+`-O3 --cce-auto-sync=off`. Passing
+`compile_flags=["-O2", "--cce-auto-sync=on"]` changes Bisheng to O2 with auto-sync
+enabled; the TileLang VS pass still runs.
 
-Ascend device printing can be enabled for one kernel without changing the process
-environment:
+Likewise, `TL_ASCEND_AUTO_SYNC=True` still enables TileLang synchronization
+insertion when `compile_flags=["--cce-auto-sync=off"]` disables Bisheng's later
+auto-sync stage. Disabling Bisheng auto-sync requires all dependencies to be
+covered by the TileLang passes or manual synchronization.
+
+Enable Ascend device printing for one kernel with:
 
 ```python
 @tilelang.jit(
@@ -60,10 +63,8 @@ def debug_kernel(...):
     ...
 ```
 
-Each `compile_flags` entry is whitespace-split and appended after the derived
-flags; an exact duplicate already present in the base command is omitted.
-TileLang does not validate options against the selected target, so prefer one
-option per list element and use only flags supported by that backend. See
+Each entry is whitespace-split; exact duplicates of base-command flags are omitted.
+TileLang does not validate target support: use one supported option per list entry. See
 [`examples/compile_flags/compile_flags_example.py`](../../examples/compile_flags/compile_flags_example.py)
 for an executable kernel-scoping example.
 
