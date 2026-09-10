@@ -2316,10 +2316,19 @@ consumer → producer 的“缓冲归还”分别使用匹配的 `set_flag` / `w
 
 1. 若 producer 的首次写需要初始 ownership，由 consumer 在入口预先归还 token；
 2. producer 获取 token、写缓冲，并在异步写完成后通知 consumer；
-3. consumer 获取 token，持有到最后一次读取完成，并在下一次 producer 复用前归还。
+3. consumer 获取 token，持有到最后一次读取完成，并在下一次 producer 复用前归还；
+4. 退出前消费所有已初始化槽位尚未消费的 token，包括未使用槽位的初始 token 和最终归还的 token。
 
-每一条实际的访问和复用边都必须配对。任务结束后若没有后续访问，不要仅为“计数平衡”
-增加 terminal wait；退出清理由该实现采用的完整协议决定。
+TileLang 的核内事件和核间通知均须在初始化、循环、分支和退出路径上保持 Set/Wait 配对。
+核间配对按同步模式的参与核及发送/接收关系判断，而非简单比较所有核的调用总数。
+可以省去不再需要的最终 Set，但不能留下未消费通知，也不能删除数据依赖或缓冲复用所需的 Wait。
+
+在已确认的 A2/A3 运行路径上，不再承担后续依赖的末尾核间通知可以不消费；这是平台特定行为，
+不适用于核内事件或仍承担依赖的通知。[官方迁移指南](https://gitcode.com/cann/ops-math/blob/master/docs/zh/develop/cross_platform_migration_guide.md)
+说明 A2 会在算子之间清理多余计数，而 Ascend 950 要求严格配对；A3 的结论仅限已实测路径。
+TileLang 为保持跨平台一致性，统一要求完整配对，`target="ascendc"` 和 `target="pto"` 均无例外。
+未配对的核内事件可能在当前调用中不暴露错误，却影响后续调用或同一芯片上的其他进程。
+**因此，实测通过不能替代配对检查。**
 
 例如，MTE2 写 L1、MTE1 读取后，正向使用 `MTE2 → MTE1`，反向归还使用
 `MTE1 → MTE2`。若 MTE1 在多个内层循环中持续读取该 L1 缓冲，必须在最后一次读取

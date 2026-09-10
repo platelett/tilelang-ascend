@@ -38,12 +38,11 @@ derive candidates from the new iteration count and L1/L0/UB budgets; benchmark
 the feasible candidates. A copied value such as `num_stages=14`, `block_M=128`,
 or 24 active Cube cores is only an experiment seed.
 
-## Manual ownership audit
+## Manual buffer ownership
 
-For every reused physical region, record the producer, consumer, first access,
-last access, and next reuse. Read the canonical synchronization rules in
-[`api-schedule-sync.md`](../../../tilelang-custom-skill/tilelang-api-best-practices/references/api-schedule-sync.md)
-before editing flags.
+A reused physical region's ownership spans its producer, consumer, first and
+last accesses, and next reuse. The synchronization contract is in the
+[Programming Guide](../../../../../docs/TileLang-Ascend%20Programming%20Guide.md).
 
 Flash Attention needs particular care at these boundaries:
 
@@ -59,9 +58,14 @@ Flash Attention needs particular care at these boundaries:
   ownership domain. Separate flags do not order two names backed by the same
   bytes.
 
-Pair every actual reuse edge. A terminal release/wait is protocol-specific:
-consume it when the implementation emits a final return that its cleanup must
-drain, but do not add a wait merely to balance counts after the last access.
+TileLang local events and cross-core flags require complete Set/Wait pairing,
+including initial tokens and final returns. Unmatched local events can leave
+one call apparently correct yet disrupt later launches or other processes on
+the same chip. Passing tests does not waive pairing. Only redundant Set/Wait
+pairs may be removed.
+
+Following one slot from initialization through acquire/return to cleanup
+makes leftover tokens visible, including initial tokens in unused slots.
 
 Local event IDs are allocated per directed `(src_pipe, dst_pipe)` pair. Reuse a
 numeric ID across different pairs only after auditing the live events in each

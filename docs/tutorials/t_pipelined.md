@@ -155,6 +155,10 @@ for k in T.Pipelined(num_iters, num_stages=4):
     T.set_flag("MTE1", "MTE2", SIG_K_L1 + side)
 
     # L0B -> M and L0C -> FIX ownership are separate protocols and are omitted.
+
+# Consume final FREE tokens, including initial tokens of unused slots.
+for side in T.serial(2):
+    T.wait_flag("MTE1", "MTE2", SIG_K_L1 + side)
 ```
 
 The two directions protect each physical `k_l1` slot. Automatic cross-core

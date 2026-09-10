@@ -167,12 +167,16 @@ T.set_flag("mte2", "v", 0)
 T.wait_flag("mte2", "v", 0)
 ```
 
-按物理缓冲区审计手动同步，而不是只检查一条 producer → consumer 通知：
+手动同步保护物理缓冲区的完整 ownership 生命周期：
 
 1. `READY` 必须在 producer 的异步写完成后交给 consumer。
 2. consumer 持有 ownership，直到对该区域的最后一次读取完成。
-3. 只有还会复用该区域时，才需要 `FREE` 返回边；不要为“计数平衡”凭空增加 terminal wait。
+3. 完整 Set/Wait 配对是 TileLang 核内、核间同步的正确性条件，涵盖初始和最终归还 token。
+   当前调用即使通过，未配对的核内事件仍可能影响后续调用或同一芯片上的其他进程。
 4. store 之前的 `T.barrier_all()` 不保护 store 之后发生的下一轮复用。
+
+小提示：沿同一槽位的“初始化 → 循环中的获取/归还 → 退出”看 token，容易发现残留；
+未使用的槽位也可能保留初始 token。
 
 event ID 的身份包含有向 `(src_pipe, dst_pipe)` pair；反向 pair 是独立编号空间。完整公开
 语义见 [Programming Guide](../../../../../docs/TileLang-Ascend%20Programming%20Guide.md)。
