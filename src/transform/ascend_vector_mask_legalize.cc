@@ -358,6 +358,8 @@ bool CallMayAffectVectorMask(const Call &call) {
 }
 
 class MaskEffectDetector final : public StmtExprVisitor {
+  void VisitStmt_(const CustomizedCodeNode *op) final { found = true; }
+
   void VisitExpr_(const CallNode *op) final {
     found |= CallMayAffectVectorMask(GetRef<Call>(op));
     if (!found) {
@@ -387,6 +389,14 @@ public:
 private:
   explicit AscendVectorMaskLegalizer(bool reuse_mask)
       : reuse_mask_(reuse_mask) {}
+
+  Stmt VisitStmt_(const CustomizedCodeNode *op) final {
+    if (vector_scope_depth_ > 0) {
+      // Like _src_code, raw text may change symbols as well as mask registers.
+      facts_ = {};
+    }
+    return GetRef<Stmt>(op);
+  }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *node = op->value.as<CallNode>();
@@ -472,7 +482,7 @@ private:
 
   template <typename LoopNode> Stmt VisitEffectfulLoop(const LoopNode *op) {
     MaskEffectDetector detector;
-    detector(op->body);
+    detector(GetRef<Stmt>(op));
     if (!detector.found) {
       return GetRef<Stmt>(op);
     }
@@ -572,14 +582,24 @@ private:
                       : ZeroPayload();
     sequence->push_back(Evaluate(
         Call(DataType::Handle(), ascend_set_mask_payload(), {lo, hi})));
-    facts_.lo = lo;
-    facts_.hi = hi;
+    facts_.lo = ReusablePayload(lo);
+    facts_.hi = ReusablePayload(hi);
+  }
+
+  std::optional<PrimExpr> ReusablePayload(const PrimExpr &value) {
+    // A load expression identifies a location, not the value sampled by a
+    // previous setter/helper. Pure expressions remain stable within the
+    // existing loop and binding boundaries.
+    if (SideEffect(value) != CallEffectKind::kPure) {
+      return std::nullopt;
+    }
+    return analyzer_.Simplify(value);
   }
 
   void ApplyField(const MaskFieldContract &field,
                   std::optional<PrimExpr> *fact) {
     if (field.ensure == MaskEnsure::kExact) {
-      *fact = analyzer_.Simplify(field.ensured);
+      *fact = ReusablePayload(field.ensured);
     } else if (field.ensure == MaskEnsure::kUnknown) {
       fact->reset();
     }

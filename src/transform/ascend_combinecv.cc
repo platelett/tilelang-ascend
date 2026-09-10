@@ -660,17 +660,21 @@ AscendResource MergeResources(AscendResource lhs, AscendResource rhs,
   return lhs == AscendResource::kExplicit ? rhs : lhs;
 }
 
-AscendResource ResourceForAccessPtr(const PrimExpr &expr) {
+std::string StorageScopeForAccessPtr(const PrimExpr &expr) {
   const auto *access = expr.as<CallNode>();
   if (access == nullptr || !access->op.same_as(builtin::tvm_access_ptr()) ||
       access->args.size() < 2) {
-    return AscendResource::kNone;
+    return "";
   }
   const auto *var = access->args[1].as<VarNode>();
   if (var == nullptr) {
-    return AscendResource::kNone;
+    return "";
   }
-  return ResourceForStorageScope(GetPtrStorageScope(GetRef<Var>(var)));
+  return GetPtrStorageScope(GetRef<Var>(var));
+}
+
+AscendResource ResourceForAccessPtr(const PrimExpr &expr) {
+  return ResourceForStorageScope(StorageScopeForAccessPtr(expr));
 }
 
 AscendResource ResourceForAccessPtrs(const Array<PrimExpr> &args, size_t begin,
@@ -698,6 +702,23 @@ AscendResource ResourceForConfiguredOperation(const std::string &name,
                                               const OperationConfig &config,
                                               const Array<PrimExpr> &args,
                                               size_t begin) {
+  if (!config.copy_scopes.empty()) {
+    ICHECK(config.copy_resource_scope == 0 || config.copy_resource_scope == 1);
+    AscendResource owner = config.copy_resource_scope == 0
+                               ? AscendResource::kCube
+                               : AscendResource::kVector;
+    ICHECK_GE(config.copy_scopes.size(), 2U);
+    ICHECK_GE(args.size(), begin + config.copy_scopes.size());
+    for (size_t i = 0; i < config.copy_scopes.size(); ++i) {
+      ICHECK_EQ(StorageScopeForAccessPtr(args[begin + i]),
+                config.copy_scopes[i])
+          << "Invalid copy operand storage scope: " << name << " operand " << i;
+    }
+    for (size_t i = begin + config.copy_scopes.size(); i < args.size(); ++i) {
+      MergeResources(owner, ResourceForAccessPtr(args[i]), name);
+    }
+    return owner;
+  }
   AscendResource operands = ResourceForAccessPtrs(args, begin, name);
   if (config.default_pipeline == "PIPE_V") {
     return MergeResources(AscendResource::kVector, operands, name);
@@ -886,6 +907,10 @@ private:
     } else if (resource_ != resource) {
       resource_ = AscendResource::kExplicit;
     }
+  }
+
+  void VisitStmt_(const CustomizedCodeNode *op) final {
+    Add(AscendResource::kExplicit);
   }
 
   void VisitExpr_(const CallNode *op) final {
@@ -1090,6 +1115,10 @@ private:
     std::string operation;
     Check(ResourceForCall(op, &operation), operation);
     StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const CustomizedCodeNode *op) final {
+    Check(AscendResource::kExplicit, "CustomizedCode");
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {

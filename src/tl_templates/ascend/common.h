@@ -471,13 +471,13 @@ CATLASS_DEVICE void cast(LocalTensor<dst> const &ubOut,
 //   AscendC::Duplicate(ubOut, value, Len);
 // }
 
-template <typename T, bool isSetMask = true>
+template <typename T>
 CATLASS_DEVICE void
 reduce_sum_half(LocalTensor<T> const &dstTensor,
                 LocalTensor<T> const &srcTensor, const int32_t mask,
                 const int32_t repeatTime, const int32_t srcRepStride) {
-  AscendC::WholeReduceSum<T, isSetMask>(dstTensor, srcTensor, mask, repeatTime,
-                                        1, 1, srcRepStride);
+  AscendC::WholeReduceSum<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
+                             srcRepStride);
 }
 
 // Row-reduce a narrow column range of a wider tile.

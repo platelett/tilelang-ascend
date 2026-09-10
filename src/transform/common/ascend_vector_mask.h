@@ -25,7 +25,6 @@ enum class SelectorRecipe : uint8_t {
   kLegacyBitwiseCount,
   kCopyUbSameType,
   kReduceNarrow,
-  kReduceHalfSum,
   kReduceComposite,
   kNormalMaskArg,
   kBroadcastComposite,

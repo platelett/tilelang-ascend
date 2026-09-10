@@ -2946,8 +2946,8 @@ void CodeGenTileLangAscend::EmitSelectedRawScalar(
   std::string scalar;
   this->PrintIndent();
   this->stream << "{\n";
-  if (semantic_args[2].as<CallNode>()) {
-    const CallNode *access = semantic_args[2].as<CallNode>();
+  const auto *access = semantic_args[2].as<CallNode>();
+  if (access && access->op.same_as(builtin::tvm_access_ptr())) {
     ICHECK_EQ(scalar_dtype, GetAccessPtrDtype(access));
     std::string buffer = PrintBufferOffset(access, false);
     this->PrintIndent();
@@ -3018,37 +3018,26 @@ void CodeGenTileLangAscend::EmitSelectedRawReduce(
   int64_t m = std::stoll(pieces[1]);
   int64_t n = std::stoll(pieces[2]);
   int64_t dim = std::stoll(pieces[3]);
+  ICHECK(view.variant().selector == tl::SelectorRecipe::kReduceNarrow);
+  const auto *physical = args.back().as<IntImmNode>();
+  ICHECK(physical != nullptr);
+  int64_t bytes =
+      pieces[0] == "float" || pieces[0] == "int32_t" || pieces[0] == "uint32_t"
+          ? 4
+          : (pieces[0] == "half" || pieces[0] == "bfloat16_t" ||
+                     pieces[0] == "int16_t" || pieces[0] == "uint16_t"
+                 ? 2
+                 : 1);
+  ICHECK_EQ(dim, -1);
+  ICHECK_EQ((physical->value * bytes) % 32, 0);
+  std::string helper =
+      tagged.find("reduce_sum") != std::string::npos   ? "reduce_sum_narrow"
+      : tagged.find("reduce_min") != std::string::npos ? "reduce_min_narrow"
+                                                       : "reduce_max_narrow";
   this->PrintIndent();
-  if (view.variant().selector == tl::SelectorRecipe::kReduceNarrow) {
-    const auto *physical = args.back().as<IntImmNode>();
-    ICHECK(physical != nullptr);
-    int64_t bytes =
-        pieces[0] == "float" || pieces[0] == "int32_t" ||
-                pieces[0] == "uint32_t"
-            ? 4
-            : (pieces[0] == "half" || pieces[0] == "bfloat16_t" ||
-                       pieces[0] == "int16_t" || pieces[0] == "uint16_t"
-                   ? 2
-                   : 1);
-    ICHECK_EQ(dim, -1);
-    ICHECK_EQ((physical->value * bytes) % 32, 0);
-    std::string helper =
-        tagged.find("reduce_sum") != std::string::npos   ? "reduce_sum_narrow"
-        : tagged.find("reduce_min") != std::string::npos ? "reduce_min_narrow"
-                                                         : "reduce_max_narrow";
-    this->stream << "tl::ascend::" << helper << "<" << pieces[0] << ", false>("
-                 << buffers[0] << ", " << buffers[1] << ", " << n << ", " << m
-                 << ", " << physical->value * bytes / 32 << ");\n";
-    return;
-  }
-  ICHECK(view.variant().selector == tl::SelectorRecipe::kReduceHalfSum);
-  ICHECK_EQ(pieces[0], "half");
-  int64_t mask = dim == -1 ? n : (dim == 0 ? m : m * n);
-  int64_t repeat = dim == -1 ? m : (dim == 0 ? n : 1);
-  int64_t stride = dim == -1 ? (n + 15) / 16 : dim == 0 ? (m + 15) / 16 : 0;
-  this->stream << "tl::ascend::reduce_sum_half<half, false>(" << buffers[0]
-               << ", " << buffers[1] << ", " << mask << ", " << repeat << ", "
-               << stride << ");\n";
+  this->stream << "tl::ascend::" << helper << "<" << pieces[0] << ", false>("
+               << buffers[0] << ", " << buffers[1] << ", " << n << ", " << m
+               << ", " << physical->value * bytes / 32 << ");\n";
 }
 
 void CodeGenTileLangAscend::EmitSelectedRawBlockReduce(

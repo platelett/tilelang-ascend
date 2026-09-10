@@ -412,6 +412,73 @@ def test_legalizer_reuses_state_and_repairs_transitions():
     assert _setter_counts(padded_copy) == (2, 2)
 
 
+@pytest.mark.parametrize("source", ["buffer", "buffer_expr", "loop_expr", "let_expr"])
+def test_mask_payload_reuse_requires_stable_values(source):
+    index = tir.Var("i", "int32")
+    derived = tir.Var("length", "int32")
+    counts = tir.decl_buffer((1,), "int32", name="counts")
+    load = tir.BufferLoad(counts, [0])
+    expression = 96 + 32 * index
+    length = {
+        "buffer": load,
+        "buffer_expr": expression + load,
+        "loop_expr": expression,
+        "let_expr": derived,
+    }[source]
+    add = _selected_add(length)
+    body = tir.SeqStmt([tir.Evaluate(add), tir.BufferStore(counts, load + 1, [0]), tir.Evaluate(add)])
+    if source == "let_expr":
+        body = tir.LetStmt(derived, expression, body)
+    loop = tir.For(index, 0, 2, tir.ForKind.SERIAL, body)
+    result = _legalize(_with_body(_add_fp32, loop))
+    # A memory write must not reuse an earlier sampled count. Pure loop/Let
+    # expressions still share one setter within each iteration; mode survives.
+    assert _setter_counts(result) == (1, 2 if source.startswith("buffer") else 1)
+    surrounding = tir.Evaluate(_selected_add(96))
+    result = _legalize(_with_body(_add_fp32, tir.SeqStmt([surrounding, loop, surrounding])))
+    assert _setter_counts(result) == (3, 4 if source.startswith("buffer") else 3)
+
+
+def test_helper_ensures_does_not_cache_memory_reads():
+    counts = tir.decl_buffer((1,), "int32", name="counts")
+    count = tir.BufferLoad(counts, [0])
+    fill = _selected_call(
+        _call(
+            "tl.ascend_fill_experiment",
+            tir.StringImm("Fill_experiment<float>"),
+            _access("float32", "fill_dst", access_mask=2),
+            tir.FloatImm("float32", 1.0),
+            count.astype("uint64"),
+            *[_int(value) for value in (1, 1, 8)],
+        ),
+        "tl.ascend_fill_experiment_explicit_mask",
+    )
+    body = tir.SeqStmt([tir.Evaluate(fill), tir.BufferStore(counts, count + 1, [0]), tir.Evaluate(_selected_add(count))])
+    # Fill establishes NORMAL itself; Add needs COUNTER and a freshly read
+    # payload even though its expression matches the helper's earlier ensures.
+    assert _setter_counts(_legalize(_with_body(_add_fp32, body))) == (2, 1)
+
+
+@pytest.mark.parametrize("kind", ["src_code", "extern", "customized"])
+def test_opaque_symbol_changes_invalidate_mask_facts(kind):
+    value = tir.Var("value", "int32")
+    add = tir.Evaluate(_selected_add(96 + 32 * value))
+    opaque = {
+        "src_code": tir.Evaluate(_call("tl.ascend_src_code", tir.StringImm("value += 1;"))),
+        "extern": tir.Evaluate(_extern("opaque_symbol_update")),
+        "customized": tir.CustomizedCode("value += 1;"),
+    }[kind]
+    # A loop containing only opaque code must not take the mask-neutral fast
+    # path: that code can change either an input symbol or the mask itself.
+    for middle in [
+        opaque,
+        tir.For(tir.Var("i", "int32"), 0, 2, tir.ForKind.SERIAL, opaque),
+        tir.While(tir.Var("condition", "bool"), opaque),
+    ]:
+        body = _with_body(_add_fp32, tir.SeqStmt([add, middle, add]))
+        assert _setter_counts(_legalize(body)) == (2, 2)
+
+
 def test_control_flow_keeps_only_must_facts():
     cond = tir.Var("cond", "bool")
     full = _selected_add(64)
@@ -442,10 +509,22 @@ def test_control_flow_keeps_only_must_facts():
     result = _legalize(_with_body(_add_fp32, tir.SeqStmt([loop, tir.Evaluate(full)])))
     assert _setter_counts(result) == (2, 2)
 
+    value = tir.Var("length", "int32")
+    bound_add = tir.Evaluate(_selected_add(value))
+    binding = tir.LetStmt(value, 96, tir.SeqStmt([bound_add, bound_add]))
+    result = _legalize(_with_body(_add_fp32, tir.SeqStmt([binding, tir.Evaluate(_selected_add(96))])))
+    assert _setter_counts(result) == (1, 2)
+
     effectful_condition = _extern("opaque_mask_condition", dtype="bool")
-    nested_call = tir.IfThenElse(effectful_condition, tir.Evaluate(full), None)
-    with pytest.raises(Exception, match="top-level Evaluate"):
-        _legalize(_with_body(_add_fp32, tir.SeqStmt([tir.Evaluate(full), nested_call])))
+    effectful_bound = _extern("opaque_mask_bound", dtype="int32")
+    for statement in [
+        tir.IfThenElse(effectful_condition, tir.Evaluate(full), None),
+        tir.While(effectful_condition, tir.Evaluate(0)),
+        tir.For(tir.Var("i", "int32"), effectful_bound, 1, tir.ForKind.SERIAL, tir.Evaluate(0)),
+        tir.For(tir.Var("i", "int32"), 0, effectful_bound, tir.ForKind.SERIAL, tir.Evaluate(0)),
+    ]:
+        with pytest.raises(Exception, match="top-level Evaluate"):
+            _legalize(_with_body(_add_fp32, tir.SeqStmt([tir.Evaluate(full), statement])))
 
 
 @pytest.mark.parametrize(
@@ -564,16 +643,20 @@ def test_resource_scope_is_explicit_nested_and_fail_closed():
         tir.Call("handle", Op.get("tl.ascend_src_code"), [tir.StringImm("int value = 0;")]),
         _extern("opaque_ascend_helper"),
     ]
-    for call in calls:
-        function = _with_body(_add_fp32, tir.Evaluate(call), scoped=False)
+    statements = [tir.Evaluate(call) for call in calls] + [tir.CustomizedCode("int value = 0;")]
+    for statement in statements:
+        function = _with_body(_add_fp32, statement, scoped=False)
         with pytest.raises(Exception, match="must be inside T.Scope"):
             tilelang.transform.AscendResourceScopeVerify()(IRModule({"main": function}))
-
-    with (
-        tilelang.transform.PassContext(config={"tl.ascend_auto_cv_combine": True}),
-        pytest.raises(Exception, match="must be inside T.Scope"),
-    ):
-        tilelang.transform.CombineCV()(IRModule({"main": _with_body(_add_fp32, tir.Evaluate(calls[0]), scoped=False)}))
+        for scope in [0, 1]:
+            scoped = tir.AttrStmt(_int(0), "resource_scope", scope, statement)
+            function = _with_body(_add_fp32, scoped, scoped=False)
+            tilelang.transform.AscendResourceScopeVerify()(IRModule({"main": function}))
+        with (
+            tilelang.transform.PassContext(config={"tl.ascend_auto_cv_combine": True}),
+            pytest.raises(Exception, match="must be inside T.Scope"),
+        ):
+            tilelang.transform.CombineCV()(IRModule({"main": _with_body(_add_fp32, statement, scoped=False)}))
 
 
 def test_resource_scope_normalizes_pipe_case_but_rejects_ambiguous_sync():
@@ -621,6 +704,67 @@ def test_resource_scope_normalizes_pipe_case_but_rejects_ambiguous_sync():
         combine(cv_boundary)
 
 
+@pytest.mark.parametrize(
+    ("name", "scopes", "owner", "tail"),
+    [
+        ("copy_gm_to_l1", ["global", "shared.l1"], 0, []),
+        ("copy_gm_to_ub", ["global", "shared.ub"], 1, []),
+        ("copy_ub_to_gm", ["shared.ub", "global"], 1, []),
+        ("copy_ub_to_l1", ["shared.ub", "shared.l1"], 1, []),
+        ("copy_l0c_to_gm", ["wmma.accumulator", "global"], 0, []),
+        ("copy_pipe_to_l1", ["shared.l1", "shared.l1"], 0, [0]),
+        ("copy_ub_to_pipe", ["shared.ub", "shared.ub"], 1, [0]),
+        ("tl.ascend_copy_cv_experiment", ["wmma.accumulator", "shared.ub"], 0, [0]),
+        ("tl.ascend_copy_vc_experiment", ["shared.ub", "shared.l1", "shared.ub"], 1, [0, 0, 0]),
+    ],
+)
+def test_cross_resource_copy_routes(name, scopes, owner, tail):
+    def program(operand_scopes, scope=None):
+        buffers = [tir.decl_buffer((128,), "float32", name=f"b{i}", scope=s) for i, s in enumerate(operand_scopes)]
+        make_call = _call if name.startswith("tl.ascend_") else _extern
+        call = make_call(name, *[b.access_ptr("rw") for b in buffers], *[_int(value) for value in tail])
+        body = tir.Evaluate(call)
+        if scope is not None:
+            body = tir.AttrStmt(_int(0), "resource_scope", scope, body)
+        root = tir.BlockRealize([], True, tir.Block([], [], [], "tilelang_root", body))
+        return IRModule({"main": tir.PrimFunc([b.data for b in buffers], root).with_attr("npu_platform", "A5")})
+
+    verify = tilelang.transform.AscendResourceScopeVerify()
+    verify(program(scopes, owner))
+    with pytest.raises(Exception, match="operation must be inside T.Scope"):
+        verify(program(scopes, 1 - owner))
+    for index in range(len(scopes)):
+        invalid = list(scopes)
+        invalid[index] = "shared.l1" if scopes[index] != "shared.l1" else "shared.ub"
+        with pytest.raises(Exception, match="copy operand storage scope"):
+            verify(program(invalid, owner))
+
+    with tilelang.transform.PassContext(config={"tl.ascend_auto_cv_combine": True}):
+        combined = tilelang.transform.CombineCV()(program(scopes))
+    verify(combined)
+    branches = combined["main"].body.block.body.seq
+    op_name = name if name.startswith("tl.ascend_") else "tir.call_extern"
+    assert _names(branches[owner]).count(op_name) == 1
+    assert op_name not in _names(branches[1 - owner])
+
+
+@pytest.mark.parametrize("operation", ["adds", "axpy"])
+def test_codegen_accepts_conditional_scalar(operation):
+    template = _add_program(64)
+    condition = tir.Var("condition", "int32")
+
+    def replace(call):
+        if _name(call) == "tl.ascend_add":
+            scalar = tir.if_then_else(condition > 0, tir.const(2.0, "float32"), tir.const(3.0, "float32"))
+            return _call(f"tl.ascend_{operation}", call.args[0], call.args[1], scalar, call.args[-1])
+
+    body = tir.stmt_functor.ir_transform(template.body, None, replace, ["tir.Call"])
+    program = tir.PrimFunc([*template.params, condition], body, buffer_map=template.buffer_map, attrs=template.attrs)
+    source = tilelang.lower(program, target="ascendc", platform="A2").kernel_source
+    assert "AscendC::" + operation.capitalize() + "<float," in source
+    assert "condition" in source and "} else {" in source
+
+
 def test_codegen_uses_raw_false_overloads_and_reuses_mask_state():
     tilelang.disable_cache()
     normal = tilelang.compile(_two_adds, target="ascendc", platform="A2", out_idx=[2])
@@ -666,6 +810,27 @@ def test_mixed_axpy_is_selected_but_reverse_mixed_has_no_fallback():
     reverse = tir.Call("handle", base.op, [base.args[1], base.args[0], base.args[2], base.args[3]])
     with pytest.raises(Exception, match="Unsupported AscendC Axpy dtype tuple"):
         _select(_with_body(_mixed_axpy, tir.Evaluate(reverse)))
+
+
+@pytest.mark.parametrize("dim", [0, -1])
+@pytest.mark.parametrize("clear", [True, False])
+def test_half_sum_keeps_float32_accumulation(dim, clear):
+    @T.prim_func
+    def main(a: T.Tensor((64, 64), "float16"), out: T.Tensor((64,), "float16")):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a_ub = T.alloc_ub((64, 64), "float16")
+            out_ub = T.alloc_ub((64,), "float16")
+            with T.Scope("V"):
+                T.copy(a, a_ub)
+                if not clear:
+                    T.tile.fill(out_ub, 1.0)
+                T.reduce_sum(a_ub, out_ub, dim=dim, clear=clear)
+                T.copy(out_ub, out)
+
+    source = tilelang.lower(main, target="ascendc", platform="A2").kernel_source
+    assert "tl::ascend::reduce_sum<float," in source
+    assert source.count("AscendC::Cast(") == (2 if clear else 3)
+    assert "reduce_sum_half" not in source
 
 
 def test_target_scope_keeps_a5_and_pto_unchanged():
