@@ -142,8 +142,6 @@ TL_ASCEND_SEMANTIC_OP(ascend_reduce, "", 4, 6, kReduce)
 TL_ASCEND_PHYSICAL(ascend_reduce_narrow_raw_normal, kReduceNarrow,
                    kFloat16Float32, kReduce, kMask, kRawReduce,
                    "tl::ascend::reduce_narrow")
-TL_ASCEND_PHYSICAL(ascend_reduce_half_sum_raw_normal, kReduceHalfSum, kFloat16,
-                   kReduce, kMask, kRawReduce, "tl::ascend::reduce_sum_half")
 TL_ASCEND_HELPER(ascend_reduce_advanced_composite, kReduceComposite,
                  kCompositeNormalFullUnknown)
 

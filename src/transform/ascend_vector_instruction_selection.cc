@@ -559,13 +559,10 @@ ResolveSemanticCall(const Call &call,
     ReduceCallLayout layout =
         ParseReduceCallLayout(call->args, semantic.base->name.c_str());
     bool physical_row = layout.has_physical_row;
-    bool clear = !is_zero(call->args[layout.clear_index]);
-    bool half_sum = clear && tag.find("reduce_sum<half") != std::string::npos;
     SelectorRecipe recipe = physical_row ? SelectorRecipe::kReduceNarrow
-                            : half_sum   ? SelectorRecipe::kReduceHalfSum
                                          : SelectorRecipe::kReduceComposite;
     variant = FindVariant(semantic, recipe);
-    if (physical_row || half_sum) {
+    if (physical_row) {
       int64_t m = std::stoll(params[1]);
       int64_t n = std::stoll(params[2]);
       int64_t dim = std::stoll(params[3]);
