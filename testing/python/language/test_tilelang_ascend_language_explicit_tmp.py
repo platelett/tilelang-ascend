@@ -888,6 +888,41 @@ def test_explicit_arena_capacity_contract():
             _inject(_reduce_program(0), model)
 
 
+@pytest.mark.parametrize("platform", ["A2", "A3", "A5"])
+def test_fp32_reduce_workspace_follows_platform(platform):
+    program = _reduce_program(None, shape=(1, 1024)).with_attr("npu_platform", platform)
+    function = _inject(program, "ascendc")
+    workspace = _collect_calls(function, "tl.ascend_reduce")[0].args[3]
+    assert workspace.args[1].type_annotation.element_type.dtype == "uint8"
+    assert workspace.args[0].dtype == ("uint8" if platform == "A5" else "float32")
+    if platform == "A5":
+        # Preserve the legacy sum workspace; v2's smaller scratch is not its ABI.
+        assert int(workspace.args[3]) == 4096
+        narrow = _reduce_program(None, real_shape=[4, 4]).with_attr("npu_platform", platform)
+        assert len(_collect_calls(_inject(narrow, "ascendc"), "tl.ascend_reduce")[0].args) == 5
+        # Legacy explicit arenas keep the caller-owned capacity contract.
+        explicit = _reduce_program(32, shape=(1, 1024)).with_attr("npu_platform", platform)
+        assert int(_collect_calls(_inject(explicit, "ascendc"), "tl.ascend_reduce")[0].args[3].args[3]) == 32
+
+
+def test_fp32_reduce_explicit_typed_arena_preserves_byte_offset_across_platforms():
+    buffers = {
+        "arena": _ub_buffer("arena", (4112,), "float16"),
+        "src": _ub_buffer("src", (1, 1024)),
+        "dst": _ub_buffer("dst", (1,)),
+    }
+    arena = tir.BufferRegion(buffers["arena"], [tvm.ir.Range.from_min_extent(16, 4096)])
+    call = T.reduce_sum(buffers["src"], buffers["dst"], tmp=arena)
+    program = _program_from_calls([(call, 3)], list(buffers.values()), include_arena=True)
+    for platform, dtype in (("A3", "float32"), ("A5", "uint8")):
+        function = _inject(program.with_attr("npu_platform", platform), "ascendc")
+        workspace = _collect_calls(function, "tl.ascend_reduce")[0].args[3]
+        assert workspace.args[0].dtype == dtype
+        itemsize = tvm.DataType(dtype).itemsize()
+        assert int(workspace.args[2]) * itemsize == 32
+        assert int(workspace.args[3]) * itemsize == 8192
+
+
 def test_implicit_pto_reduce_allocations_follow_row_and_column_layouts():
     func = _inject(_reduce_program(None, clear=False), "pto")
     names = _allocated_buffer_names(func)
