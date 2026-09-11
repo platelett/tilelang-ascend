@@ -220,7 +220,18 @@ private:
 
       return AttrStmt(op->node, op->attr_key, op->value, new_body);
     } else if (op->attr_key == "unrolled_loop") {
+      const PrimExpr extent = Downcast<PrimExpr>(op->node);
+      if (analyzer_->CanProve(extent <= 0)) {
+        // No body access or handoff executes on this path.
+        return Evaluate(0);
+      }
+      const bool may_be_empty = !analyzer_->CanProve(extent > 0);
+      auto entry_history =
+          may_be_empty ? current_access_history_ : AccessHistory{};
       Stmt new_body = VisitStmt(op->body);
+      if (may_be_empty) {
+        JoinAccessHistories(entry_history);
+      }
       return AttrStmt(op->node, op->attr_key, op->value, new_body);
     } else if (op->attr_key == "iteration_start" ||
                op->attr_key == "iteration_end") {
@@ -346,8 +357,10 @@ private:
         unrolled_seq = SeqStmt(unrolled_stmts);
       }
 
-      return AttrStmt(make_zero(DataType::Int(32)), "unrolled_loop",
-                      StringImm(loop_id), unrolled_seq);
+      // Preserve the trip count while the two synthetic iterations expose
+      // loop-carried dependencies to the linear access analysis.
+      return AttrStmt(op->extent, "unrolled_loop", StringImm(loop_id),
+                      unrolled_seq);
     }
 
     Stmt VisitStmt_(const SeqStmtNode *op) override {
@@ -891,6 +904,22 @@ private:
       return false;
     }
 
+    SyncGraph IntersectCompletion(const SyncGraph &other,
+                                  const std::string &producer) const {
+      SyncGraph common;
+      for (const auto &pair : graph) {
+        for (const auto &destination : pair.second) {
+          if (destination != producer && HasPath(producer, destination) &&
+              other.HasPath(producer, destination)) {
+            // The two paths can prove completion via different intermediate
+            // pipes. Keep their common destinations, not just common edges.
+            common.graph[producer].insert(destination);
+          }
+        }
+      }
+      return common;
+    }
+
     void Merge(const SyncGraph &other) {
       for (const auto &pair : other.graph) {
         const std::string &src = pair.first;
@@ -961,6 +990,9 @@ private:
       return oss.str();
     }
   };
+
+  using AccessHistory =
+      std::unordered_map<std::string, std::vector<BufferAccess>>;
 
   struct SyncRequirement {
     std::string sync_type;
@@ -1333,6 +1365,44 @@ private:
     }
   }
 
+  void JoinAccessHistories(const AccessHistory &entry_history) {
+    AccessHistory joined;
+    auto merge_path = [&](const AccessHistory &path) {
+      for (const auto &pair : path) {
+        auto &accesses = joined[pair.first];
+        for (const auto &access : pair.second) {
+          auto previous = std::find_if(
+              accesses.begin(), accesses.end(), [&](const BufferAccess &other) {
+                return other.pipeline == access.pipeline &&
+                       other.is_write == access.is_write;
+              });
+          if (previous == accesses.end()) {
+            // This access may exist only on the entry or the executed path.
+            accesses.push_back(access);
+            continue;
+          }
+          previous->sync_graph = previous->sync_graph.IntersectCompletion(
+              access.sync_graph, access.pipeline.substr(5));
+          for (auto barrier = previous->pipe_barriers.begin();
+               barrier != previous->pipe_barriers.end();) {
+            if (!access.pipe_barriers.count(*barrier)) {
+              barrier = previous->pipe_barriers.erase(barrier);
+            } else {
+              ++barrier;
+            }
+          }
+          previous->is_sliced |= access.is_sliced;
+        }
+      }
+    };
+    // Keep every possibly outstanding access, but only completion facts true
+    // on both paths for a shared access class. Joining by pipe and read/write
+    // kind bounds the state even across consecutive or nested optional loops.
+    merge_path(entry_history);
+    merge_path(current_access_history_);
+    current_access_history_ = std::move(joined);
+  }
+
   std::vector<SyncRequirement>
   CollectSyncRequirements(const std::vector<BufferAccess> &accesses) {
     std::vector<SyncRequirement> requirements;
@@ -1563,10 +1633,10 @@ private:
   int event_id_counter_ = 0;
   std::unordered_map<std::string, std::string> event_mapping_;
   std::unordered_map<std::string, OperationConfig> operation_config_;
-  // One last writer plus the latest reader on each pipe, per logical buffer.
+  // Normally one last writer plus the latest reader on each pipe. An optional
+  // loop can retain alternative writers, bounded to one per pipe as well.
   // Physical aliases are joined by FindRelatedBuffers at each access.
-  std::unordered_map<std::string, std::vector<BufferAccess>>
-      current_access_history_;
+  AccessHistory current_access_history_;
   Map<Var, PrimExpr> address_map_;
   Map<Var, PrimExpr> size_map_;
   std::string platform_;

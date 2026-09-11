@@ -30,14 +30,18 @@ def _fill(dst):
     return tir.Evaluate(tir.call_extern("handle", "AscendC::Duplicate", dst.access_ptr("w")))
 
 
-def _run(buffers, statements, b_offset=0):
+def _run(buffers, statements, b_offset=0, scalars=()):
     body = statements[0] if len(statements) == 1 else tir.SeqStmt(statements)
     offsets = {"a": 0, "b": b_offset, "tmp": 4096, "other": 8192}
     for name in offsets:
         buffer = buffers[name]
         body = tir.Allocate(buffer.data, buffer.dtype, [64], tir.const(True, "bool"), body)
     inputs = [buffers["input"], buffers["output"]]
-    function = tir.PrimFunc([buffer.data for buffer in inputs], body, buffer_map={buffer.data: buffer for buffer in inputs})
+    function = tir.PrimFunc(
+        [buffer.data for buffer in inputs] + list(scalars),
+        body,
+        buffer_map={buffer.data: buffer for buffer in inputs},
+    )
     function = function.with_attr("address_map", {buffers[name].data: value for name, value in offsets.items()})
     function = function.with_attr("size_map", {buffers[name].data: 256 for name in offsets})
     target = tvm.target.Target("c -keys=ascend -model=ascendc")
@@ -219,3 +223,110 @@ def test_scalar_alias_write_waits_for_all_readers():
     assert {"MTE3_S", "V_S"}.issubset(_events(function))
     _assert_handoff(function, "MTE3_S", statements[0], statements[-1])
     _assert_handoff(function, "V_S", statements[1], statements[-1])
+
+
+def _loop(extent, statements, name="i"):
+    body = statements[0] if len(statements) == 1 else tir.SeqStmt(statements)
+    return tir.For(tir.Var(name, "int32"), 0, extent, tir.ForKind.SERIAL, body)
+
+
+def _outside_loops(function):
+    """Return the operations that execute even when every loop is empty."""
+    operations = []
+
+    def visit(stmt):
+        if isinstance(stmt, tir.For):
+            return
+        if isinstance(stmt, tir.SeqStmt):
+            for child in stmt.seq:
+                visit(child)
+        elif isinstance(stmt, (tir.Allocate, tir.AttrStmt)):
+            visit(stmt.body)
+        else:
+            operations.extend(_operations(stmt))
+
+    visit(function.body)
+    return operations
+
+
+@pytest.mark.parametrize("trip_count", [0, 1, 3, "dynamic", "positive"])
+def test_loop_exit_preserves_the_zero_trip_reader(trip_count):
+    buffers = _buffers()
+    n = tir.Var("n", "int32")
+    if trip_count == "dynamic":
+        extent = n
+    elif trip_count == "positive":
+        extent = tir.Max(n, 1)
+    else:
+        extent = trip_count
+    read = _copy("copy_ub_to_gm", buffers["a"], buffers["output"])
+    overwrite = _fill(buffers["b"])
+    loop = _loop(extent, [overwrite, _copy("copy_gm_to_ub", buffers["input"], buffers["b"])])
+    function = _run(buffers, [read, loop, overwrite], scalars=[n])
+    outside = _outside_loops(function)
+    needs_exit_handoff = trip_count in (0, "dynamic")
+    assert ("MTE3_V" in _events(outside)) == needs_exit_handoff
+    if needs_exit_handoff:
+        _assert_handoff(outside, "MTE3_V", read, overwrite)
+    if trip_count == 0:
+        assert "MTE2_V" not in _events(outside)
+        assert "for " not in function.script()
+    else:
+        # A possible last MTE2 writer still needs ordering on the taken path.
+        assert "MTE2_V" in _events(outside)
+        loops = []
+        tir.stmt_functor.post_order_visit(function.body, lambda node: loops.append(node) if isinstance(node, tir.For) else None)
+        assert len(loops) == 1
+        assert "MTE3_V" in _events(loops[0].body)
+
+
+def test_optional_loop_preserves_an_entry_writer_replaced_in_the_body():
+    buffers = _buffers()
+    n = tir.Var("n", "int32")
+    entry_write = _copy("copy_gm_to_ub", buffers["input"], buffers["a"])
+    loop_write = _fill(buffers["a"])
+    read = _copy("copy_ub_to_gm", buffers["a"], buffers["output"])
+    function = _run(buffers, [entry_write, _loop(n, [loop_write]), read], scalars=[n])
+    outside = _outside_loops(function)
+    assert {"MTE2_MTE3", "V_MTE3"}.issubset(_events(outside))
+    _assert_handoff(outside, "MTE2_MTE3", entry_write, read)
+
+
+def test_optional_loop_intersects_completion_for_different_writer_generations():
+    buffers = _buffers()
+    n = tir.Var("n", "int32")
+    write = _copy("copy_gm_to_ub", buffers["input"], buffers["a"])
+    read = _copy("copy_ub_to_gm", buffers["a"], buffers["output"])
+    # The entry writer has completed to MTE3, but a new writer on the same pipe
+    # exists only when the loop executes and has not completed to MTE3 yet.
+    function = _run(buffers, [write, read, _loop(n, [write]), read], scalars=[n])
+    assert _events(_outside_loops(function)).count("MTE2_MTE3") == 2
+
+
+def test_optional_loop_keeps_completion_proven_before_entry():
+    buffers = _buffers()
+    n = tir.Var("n", "int32")
+    read = _copy("copy_ub_to_gm", buffers["a"], buffers["output"])
+    overwrite = _fill(buffers["b"])
+    function = _run(buffers, [read, overwrite, _loop(n, [_fill(buffers["other"])]), overwrite], scalars=[n])
+    # Entry and taken paths both know the original alias reader has completed.
+    assert _events(_outside_loops(function)).count("MTE3_V") == 1
+
+
+@pytest.mark.parametrize("layout", ["consecutive", "zero_consecutive", "nested", "positive_outer", "zero_outer"])
+def test_optional_loops_compose_without_losing_the_entry_reader(layout):
+    buffers = _buffers()
+    n, m = tir.Var("n", "int32"), tir.Var("m", "int32")
+    read = _copy("copy_ub_to_gm", buffers["a"], buffers["output"])
+    overwrite = _fill(buffers["b"])
+    body = [overwrite, _copy("copy_gm_to_ub", buffers["input"], buffers["b"])]
+    inner = _loop(m, body, "j")
+    if layout == "zero_consecutive":
+        loops = [_loop(0, body), _loop(0, body, "j")]
+    elif layout == "consecutive":
+        loops = [_loop(n, body), inner]
+    else:
+        outer_extent = {"positive_outer": 2, "zero_outer": 0}.get(layout, n)
+        loops = [_loop(outer_extent, [inner])]
+    function = _run(buffers, [read, *loops, overwrite], scalars=[n, m])
+    _assert_handoff(_outside_loops(function), "MTE3_V", read, overwrite)
