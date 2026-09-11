@@ -874,14 +874,14 @@ def test_explicit_arena_capacity_contract():
     assert int(pto_call.args[4].args[2]) == 256
     assert int(pto_call.args[4].args[3]) == 32
 
-    ascendc_func = _inject(_reduce_program(1120), "ascendc")
+    ascendc_func = _inject(_reduce_program(576), "ascendc")
     ascendc_call = _collect_calls(ascendc_func, "tl.ascend_reduce")[0]
     assert ascendc_call.args[3].args[1].name == "arena_ub"
     assert ascendc_call.args[3].args[0].dtype == "float32"
-    assert int(ascendc_call.args[3].args[3]) == 280
+    assert int(ascendc_call.args[3].args[3]) == 144
 
-    with pytest.raises(tvm.error.TVMError, match=r"too small.*1119 bytes.*need 1120"):
-        _inject(_reduce_program(1119), "ascendc")
+    with pytest.raises(tvm.error.TVMError, match=r"too small.*575 bytes.*need 576"):
+        _inject(_reduce_program(575), "ascendc")
 
     for model in ["ascendc", "pto"]:
         with pytest.raises(tvm.error.TVMError, match=r"is empty.*non-empty workspace"):
@@ -1032,10 +1032,10 @@ def test_ascendc_half_sum_reduce_needs_widen_workspace():
 @pytest.mark.parametrize(
     ("op", "shape", "dim", "expected_bytes"),
     [
-        ("sum", (8, 64), -1, 1120),
-        ("sum", (8, 256), -1, 4192),
-        ("max", (8, 32), -1, 256),
-        ("max", (8, 64), -1, 1120),
+        ("sum", (8, 64), -1, 576),
+        ("sum", (8, 256), -1, 2400),
+        ("max", (8, 32), -1, 128),
+        ("max", (8, 64), -1, 576),
         ("sum", (8, 64), 0, 1024),
     ],
 )
