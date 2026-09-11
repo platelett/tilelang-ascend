@@ -41,8 +41,15 @@ struct Plan {
   bool legal{};
 };
 struct Layout {
-  uint32_t workElements{}, elements{};
+  uint32_t workElements[2]{}, work1Offset{}, auxiliaryOffset{}, elements{};
 };
+constexpr Layout MakeLayout(uint32_t work0, uint32_t work1, uint32_t auxiliary) {
+  // Each used slot owns one extra DataBlock for its runtime parity adjustment.
+  const uint32_t reserved0 = work0 ? work0 + kFp32PerDataBlock : 0;
+  const uint32_t reserved1 = work1 ? work1 + kFp32PerDataBlock : 0;
+  return {{work0, work1}, reserved0, reserved0 + reserved1,
+          reserved0 + reserved1 + auxiliary};
+}
 constexpr Plan Invalid() { return {}; }
 constexpr Plan Done() {
   Plan p{};
@@ -234,20 +241,23 @@ constexpr uint32_t ColumnElements(uint32_t m, uint32_t logical, uint32_t pitch,
 }
 constexpr Layout Place(uint32_t m, const Plan &plan) {
   if (plan.count == 1 && plan.step[0].leaf == Leaf::Columns) {
-    return {0, ColumnElements(m, plan.step[0].logical, plan.step[0].pitch,
-                              plan.step[0].merge)};
+    return MakeLayout(0, 0,
+                      ColumnElements(m, plan.step[0].logical,
+                                     plan.step[0].pitch, plan.step[0].merge));
   }
   if (plan.count == 1 && (plan.step[0].leaf == Leaf::M1TwoBinaryReductions ||
                           plan.step[0].leaf == Leaf::M1OneBinaryReduction))
-    return {0, 64 + (plan.step[0].merge ? 8U : 0U)};
+    return MakeLayout(0, 0, 64 + (plan.step[0].merge ? 8U : 0U));
   if (plan.count == 1 && plan.step[0].leaf != Leaf::None)
-    return {0, plan.step[0].merge ? AlignUp(m, 8) : 8};
-  uint32_t work = 8, aux = AlignUp(m, 8);
+    return MakeLayout(0, 0, plan.step[0].merge ? AlignUp(m, 8) : 8);
+  uint32_t work[2]{}, aux = AlignUp(m, 8);
   for (uint32_t i = 0; i < plan.count; ++i) {
-    if (plan.step[i].nextLogical) {
+    if (plan.step[i].leaf == Leaf::None && plan.step[i].nextLogical) {
+      // Run writes even steps to work0 and odd steps to work1. Keep the full
+      // physical row span: the next step can read padding beyond nextLogical.
       const uint32_t size = m * plan.step[i].nextPitch * 8;
-      if (size > work)
-        work = size;
+      if (size > work[i % 2])
+        work[i % 2] = size;
     }
     if (plan.step[i].leaf == Leaf::Columns) {
       const uint32_t size = ColumnElements(
@@ -265,7 +275,7 @@ constexpr Layout Place(uint32_t m, const Plan &plan) {
         aux = size;
     }
   }
-  return {work, 2 * (8 + work) + aux};
+  return MakeLayout(work[0], work[1], aux);
 }
 constexpr bool Fits(uint32_t m, uint32_t srcRowStride, const Plan &plan) {
   if (!plan.legal)
@@ -883,17 +893,20 @@ template <class T, uint32_t I = 0> __aicore__ inline void Run(Context &c) {
 template <class T>
 __aicore__ inline void ReduceGeneral(__ubuf__ float *dst, __ubuf__ float *src,
                                      __ubuf__ float *tmp) {
-  __ubuf__ float *raw0 = tmp, *raw1 = tmp + 8 + T::layout.workElements;
   const uint32_t srcParity =
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(src) >> 5) & 1U;
-  const uint32_t pad0 = ((reinterpret_cast<uintptr_t>(raw0) >> 5) & 1U) ^
-                        srcParity ^ 1U,
-                 pad1 = ((reinterpret_cast<uintptr_t>(raw1) >> 5) & 1U) ^
-                        srcParity;
-  __ubuf__ float *aux = T::plan.count == 1 && T::plan.step[0].leaf != Leaf::None
-                            ? tmp
-                            : tmp + 2 * (8 + T::layout.workElements);
-  Context c{dst, src, raw0 + pad0 * 8, raw1 + pad1 * 8, aux};
+  Context c{dst, src, nullptr, nullptr, tmp + T::layout.auxiliaryOffset};
+  if constexpr (T::layout.workElements[0]) {
+    const uint32_t pad0 = ((reinterpret_cast<uintptr_t>(tmp) >> 5) & 1U) ^
+                          srcParity ^ 1U;
+    c.work0 = tmp + pad0 * 8;
+  }
+  if constexpr (T::layout.workElements[1]) {
+    __ubuf__ float *raw1 = tmp + T::layout.work1Offset;
+    const uint32_t pad1 = ((reinterpret_cast<uintptr_t>(raw1) >> 5) & 1U) ^
+                          srcParity;
+    c.work1 = raw1 + pad1 * 8;
+  }
   Run<T>(c);
   SetFullMask();
 }

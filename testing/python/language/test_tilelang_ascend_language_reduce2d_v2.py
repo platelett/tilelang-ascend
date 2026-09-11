@@ -151,6 +151,25 @@ def test_fp32_reduce2d_v2_runtime_smoke():
     torch.testing.assert_close(result.cpu(), expected, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.parametrize(
+    "m,n,physical_row,scratch_bytes",
+    [(247, 63, 184, 8928), (1, 16384, 16384, 9312), (1, 8, 8, 32)],
+)
+def test_fp32_row_reduce_sizes_used_intermediate_slots(m, n, physical_row, scratch_bytes):
+    """Protect one-slot, unequal two-slot, and leaf-only scratch layouts."""
+    compiled = tilelang.compile(
+        _kernel(m, n, physical_row, "float32", "sum", True),
+        out_idx=[1],
+        target="ascendc",
+        pass_configs=PASS_CONFIGS,
+    )
+    assert f"tmp_ub = ascend_ub.GetWithOffset<uint8_t>({scratch_bytes}," in compiled.get_kernel_source()
+    host = torch.arange(m * physical_row, dtype=torch.float32).reshape(m, physical_row) % 29 - 14
+    host[:, n:] = 1.0e6
+    expected = host[:, :n].sum(dim=1)
+    torch.testing.assert_close(compiled(host.npu()).cpu(), expected, rtol=0, atol=0)
+
+
 def test_codegen_selects_v2_kinds_and_preserves_other_backends():
     for kind, enum_name in (("sum", "kSum"), ("max", "kMax"), ("min", "kMin")):
         fp32 = _source(
