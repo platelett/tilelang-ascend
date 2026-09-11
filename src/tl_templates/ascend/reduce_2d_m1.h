@@ -52,7 +52,7 @@ __aicore__ inline void EmitM1(Context &c, __ubuf__ float *src) {
       SetMask<1>();
       BinaryReduce<T>(c.dst, c.dst, src, 1, 1, 1, 1, 8, 8, 8);
     } else
-      copy_ubuf_to_ubuf(c.dst, src, 0, 1, 1, 0, 0);
+      CopyPartialBlock<1>(c.dst, src);
   } else {
     __ubuf__ float *reduced = s.merge ? c.aux : c.dst;
     SetMask<(uint64_t{1} << s.logical) - 1>();

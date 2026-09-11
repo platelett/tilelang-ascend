@@ -170,6 +170,70 @@ def test_fp32_row_reduce_sizes_used_intermediate_slots(m, n, physical_row, scrat
     torch.testing.assert_close(compiled(host.npu()).cpu(), expected, rtol=0, atol=0)
 
 
+def _output_slice_kernel(m, n, physical_row, kind, clear):
+    reduce_fn = {"sum": T.reduce_sum, "max": T.reduce_max, "min": T.reduce_min}[kind]
+    storage = 16 + (m + 7) // 8 * 8
+
+    @T.prim_func
+    def main(
+        a: T.Tensor((m, physical_row), "float32"),  # type: ignore
+        initial: T.Tensor((storage,), "float32"),  # type: ignore
+        b: T.Tensor((storage,), "float32"),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (_, vid):
+            src = T.alloc_ub((m, physical_row), "float32")
+            dst = T.alloc_ub((storage,), "float32")
+            with T.Scope("V"):
+                if vid == 0:
+                    T.copy(a, src)
+                    T.copy(initial, dst)
+                    reduce_fn(src, dst[8 : 8 + m], dim=-1, real_shape=[m, n], clear=clear)
+                    T.copy(dst, b)
+
+    return main
+
+
+@pytest.mark.parametrize(
+    "m,n,physical_row,kind,clear",
+    [
+        (m, n, physical_row, kind, clear)
+        for m, n, physical_row in [(1, 1, 8), (9, 8, 8)]
+        for kind in ["sum", "max", "min"]
+        for clear in [True, False]
+    ]
+    + [(3, 9, 24, "sum", True)],
+)
+def test_fp32_row_reduce_preserves_output_slice_neighbors(m, n, physical_row, kind, clear):
+    """Protect the scalar copy, staged tail, and odd-pitch two-column output."""
+    compiled = tilelang.compile(
+        _output_slice_kernel(m, n, physical_row, kind, clear),
+        out_idx=[2],
+        target="ascendc",
+        pass_configs=PASS_CONFIGS,
+        compile_flags=["--cce-auto-sync=off", "-O3"],
+    )
+    host = torch.arange(m * physical_row, dtype=torch.float32).reshape(m, physical_row) % 29 - 14
+    host[:, n:] = 1.0e6
+    initial = torch.full((16 + (m + 7) // 8 * 8,), 12345.0)
+    initial[8 : 8 + m] = 2.0
+    logical = host[:, :n]
+    if kind == "sum":
+        reduced = logical.sum(dim=1)
+        if not clear:
+            reduced = reduced + 2.0
+    elif kind == "max":
+        reduced = logical.max(dim=1).values
+        if not clear:
+            reduced = torch.maximum(reduced, torch.tensor(2.0))
+    else:
+        reduced = logical.min(dim=1).values
+        if not clear:
+            reduced = torch.minimum(reduced, torch.tensor(2.0))
+    expected = initial.clone()
+    expected[8 : 8 + m] = reduced
+    torch.testing.assert_close(compiled(host.npu(), initial.npu()).cpu(), expected, rtol=0, atol=0)
+
+
 def test_codegen_selects_v2_kinds_and_preserves_other_backends():
     for kind, enum_name in (("sum", "kSum"), ("max", "kMax"), ("min", "kMin")):
         fp32 = _source(

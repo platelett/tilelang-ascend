@@ -436,6 +436,14 @@ __aicore__ inline void SetFullMask() {
   set_vector_mask(~uint64_t{0}, ~uint64_t{0});
 }
 template <uint32_t Count>
+__aicore__ inline void CopyPartialBlock(__ubuf__ float *dst,
+                                        __ubuf__ float *src) {
+  static_assert(Count > 0 && Count <= 8);
+  SetMask<ContinuousMask<Count>::value>();
+  vcopy(reinterpret_cast<__ubuf__ uint32_t *>(dst),
+        reinterpret_cast<__ubuf__ uint32_t *>(src), 1, 1, 1, 8, 8);
+}
+template <uint32_t Count>
 __aicore__ inline void Delay(__ubuf__ float *scratch) {
   if constexpr (Count) {
     vcgmax(scratch, scratch, 0, 1, 1, 8);
@@ -648,9 +656,10 @@ __aicore__ inline void EmitVcmax(Context &c, __ubuf__ float *src) {
   }
 }
 template <class T, uint32_t I, uint32_t Column, uint32_t DstStride = 0,
-          uint32_t Start = 0, bool Stage = true>
+          uint32_t Start = 0, bool Stage = true, bool ExactOutput = false>
 __aicore__ inline void ScanLeafColumn(__ubuf__ float *out, __ubuf__ float *src,
-                                      __ubuf__ float *tail) {
+                                      __ubuf__ float *tail,
+                                      __ubuf__ float *partial = nullptr) {
   constexpr Step s = T::plan.step[I];
   constexpr uint32_t groups = T::kM / 8,
                      stride = DstStride ? DstStride : (s.pitch % 2 ? 1 : 2),
@@ -665,14 +674,22 @@ __aicore__ inline void ScanLeafColumn(__ubuf__ float *out, __ubuf__ float *src,
     GroupReduce<T>(out + Start * stride * 8,
                    src + Start * 8 * s.pitch * 8 + Column * 8, count, stride,
                    s.pitch, 8 * s.pitch);
-    ScanLeafColumn<T, I, Column, DstStride, Start + count, Stage>(out, src,
-                                                                  tail);
+    ScanLeafColumn<T, I, Column, DstStride, Start + count, Stage, ExactOutput>(
+        out, src, tail, partial);
   }
   if constexpr (Start == groups && T::kM % 8) {
     SetMask<RowMask<Stage ? 8 : T::kM % 8, valid>::value>();
     __ubuf__ float *input = Stage ? tail : src + groups * 8 * s.pitch * 8;
-    GroupReduce<T>(out + groups * stride * 8, input + Column * 8, 1, stride,
-                   s.pitch, 8 * s.pitch);
+    __ubuf__ float *output = out + groups * stride * 8;
+    GroupReduce<T>(ExactOutput ? partial : output, input + Column * 8, 1,
+                   stride, s.pitch, 8 * s.pitch);
+    if constexpr (ExactOutput) {
+      // The packed reduction may write a full block. Only the live rows belong
+      // to the caller's output slice; keep the remaining lanes in scratch.
+      pipe_barrier(PIPE_V);
+      CopyPartialBlock<T::kM % 8>(output, partial);
+      pipe_barrier(PIPE_V);
+    }
   }
 }
 template <class T, uint32_t I = 0, bool Stage = true> struct ColumnTiming {
@@ -786,7 +803,13 @@ __aicore__ inline void EmitColumnsLeaf(Context &c, __ubuf__ float *src) {
         c.aux);
   }
   if constexpr (count == 1) {
-    ScanLeafColumn<T, I, 0, 1, 0, Stage>(result, src, tail);
+    if constexpr (!s.merge && T::kM % 8) {
+      // ColumnElements reserves one result block after the staged input rows.
+      __ubuf__ float *partial = tail + (Stage ? 8 * s.pitch * 8 : 0);
+      ScanLeafColumn<T, I, 0, 1, 0, Stage, true>(result, src, tail, partial);
+    } else {
+      ScanLeafColumn<T, I, 0, 1, 0, Stage>(result, src, tail);
+    }
     if constexpr (s.merge) {
       WaitForVectorData<T, typename ColumnTiming<T, I, Stage>::Final>(c.aux);
       MergeColumn<T, true>(c.dst, result);
@@ -799,7 +822,9 @@ __aicore__ inline void EmitColumnsLeaf(Context &c, __ubuf__ float *src) {
                                      : (((base ^ raw) >> 5) & 1U) ^ 1U;
     __ubuf__ float *slots = columnRaw + pad * 8;
     if constexpr (s.pitch % 2 && count == 2) {
-      ScanLeafColumn<T, I, 0, 1, 0, Stage>(result, src, tail);
+      // The first column normally writes result directly, leaving slot 0 free.
+      ScanLeafColumn<T, I, 0, 1, 0, Stage, !s.merge>(
+          result, src, tail, ColumnSlot<T, I, 0>(slots));
       ScanLeafColumn<T, I, 1, 0, 0, Stage>(ColumnSlot<T, I, 1>(slots), src,
                                            tail);
       WaitForVectorData<T, typename ColumnTiming<T, I, Stage>::Final>(c.aux);
