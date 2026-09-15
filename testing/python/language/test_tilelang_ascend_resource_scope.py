@@ -156,6 +156,64 @@ def test_empty_pipeline_preserves_loop_and_condition_evaluation():
     assert sorted(call.args[0].value for call in calls) == ["condition", "loop_extent", "loop_min"]
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_pipeline_with_nested_serial_loop_lowers_after_cv_split(dynamic):
+    @T.prim_func
+    def main(A: T.Tensor((4, 64), "float32"), B: T.Tensor((4, 64), "float32"), repeats: T.int32):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a = T.alloc_ub((64,), "float32")
+            b = T.alloc_ub((64,), "float32")
+            for k in T.Pipelined(4, num_stages=2):
+                T.copy(A[k, :], a)
+                if dynamic:
+                    for _r in T.serial(repeats):
+                        T.tile.add(b, a, a)
+                else:
+                    for _r in T.serial(2):
+                        T.tile.add(b, a, a)
+                T.copy(b, B[k, :])
+
+    config = {
+        "tl.ascend_auto_sync": True,
+        "tl.ascend_auto_cv_combine": True,
+        "tl.ascend_auto_cross_core_sync": True,
+        "tl.ascend_memory_planning": True,
+    }
+    with tilelang.transform.PassContext(config=config):
+        source = tilelang.lower(main, target="ascendc", platform="A3").kernel_source
+    assert "AscendC::Add<float, false>" in source
+    assert "copy_gm_to_ub" in source and "copy_ub_to_gm" in source
+    if dynamic:
+        assert "< repeats;" in source
+
+
+def test_nested_empty_pipelines_preserve_control_and_clear_all_scheduling():
+    from tvm import ir
+    from tvm.target import Target
+
+    n = tir.Var("n", "int32")
+    i, j = tir.Var("i", "int32"), tir.Var("j", "int32")
+    annotations = {
+        "num_stages": 2,
+        "tl_pipeline_order": [0],
+        "tl_pipeline_stage": [0],
+        "software_pipeline_order": [0],
+        "software_pipeline_stage": [0],
+        "software_pipeline_async_stages": [0],
+        "preserved": 7,
+    }
+    inner = tir.For(j, 1, n, tir.ForKind.SERIAL, tir.Evaluate(0), annotations=annotations)
+    body = tir.While(n > 0, inner)
+    outer = tir.For(i, 0, 4, tir.ForKind.SERIAL, body, annotations=annotations)
+    function = tir.PrimFunc([n], outer).with_attr("target", Target({"kind": "llvm", "model": "ascendc"}))
+    planned = tilelang.transform.PipelinePlanning()(IRModule({"main": function}))
+    injected = tilelang.transform.InjectSoftwarePipeline()(planned)
+    expected_inner = tir.For(j, 1, n, tir.ForKind.SERIAL, tir.Evaluate(0), annotations={"preserved": 7})
+    expected = tir.For(i, 0, 4, tir.ForKind.SERIAL, tir.While(n > 0, expected_inner), annotations={"preserved": 7})
+    ir.assert_structural_equal(planned["main"].body, expected)
+    ir.assert_structural_equal(injected["main"].body, expected)
+
+
 def test_explicit_blocks_keep_separate_cpp_local_scopes():
     @T.prim_func
     def main(A: T.Tensor((64,), "float32")):

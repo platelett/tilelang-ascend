@@ -48,21 +48,6 @@ bool IsAccessPtr(const PrimExpr &expr) {
   return call && call->op.same_as(tir::builtin::tvm_access_ptr());
 }
 
-void ValidateCounterConstant(const PrimExpr &value, const std::string &name) {
-  arith::Analyzer analyzer;
-  PrimExpr simplified = analyzer.Simplify(value);
-  const auto *constant = simplified.as<IntImmNode>();
-  if (constant == nullptr) {
-    return;
-  }
-  ICHECK_GE(constant->value, 0)
-      << name << " must not be a negative constant, got " << simplified;
-  ICHECK_LE(static_cast<uint64_t>(constant->value),
-            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
-      << name << " must fit the dav-c220 32-bit COUNTER payload, got "
-      << simplified;
-}
-
 void ValidateConstantRange(const PrimExpr &value, uint64_t maximum,
                            const std::string &name) {
   auto valid = [&](bool condition) {
@@ -83,6 +68,12 @@ void ValidateConstantRange(const PrimExpr &value, uint64_t maximum,
         (static_cast<uint64_t>(static_cast<uint32_t>(hi->value)) << 32);
     valid(integer <= maximum);
   }
+}
+
+void ValidateCounterConstant(const PrimExpr &value, const std::string &name) {
+  arith::Analyzer analyzer;
+  ValidateConstantRange(analyzer.Simplify(value),
+                        std::numeric_limits<uint32_t>::max(), name);
 }
 
 size_t NormalMaskArgument(const AscendVectorSemanticOpSpec &semantic) {

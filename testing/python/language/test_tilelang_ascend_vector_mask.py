@@ -6,7 +6,7 @@ import tilelang
 import tilelang.language as T
 from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget
 from tvm import DataType, IRModule, arith, get_global_func, tir
-from tvm.ir import Op
+from tvm.ir import Op, assert_structural_equal
 from tvm.target import Target
 
 
@@ -230,12 +230,37 @@ def test_selection_uses_normal_and_counter_without_dtype_fallback():
     with pytest.raises(Exception, match="payload does not match"):
         _select(_with_body(_add_fp32, tir.Evaluate(wrong_count)))
 
-    with pytest.raises(Exception, match="must not be a negative constant"):
+    with pytest.raises(Exception, match=r"must be in \[0, 4294967295\]"):
         _selected_add(-1)
 
     lowered = LowerAndLegalize(IRModule({"main": _add_uint32}), ASCENDC)
     with pytest.raises(Exception, match="Unsupported AscendC Vector dtype uint32.*no fallback"):
         OptimizeForTarget(lowered, ASCENDC, "A2")
+
+
+@pytest.mark.parametrize("operation", ["add", "cast"])
+def test_counter_range_accepts_runtime_counts_and_checks_large_literals(operation):
+    def selected_count(count):
+        if operation == "add":
+            selected = _selected_add(count)
+            assert selected.args[-4].value == 1  # COUNTER mode
+            return selected.args[-2]
+        call = _call(
+            "tl.ascend_cast",
+            _access("float32", "cast_dst", access_mask=2),
+            _access("float16", "cast_src", access_mask=1),
+            tir.StringImm("CAST_NONE"),
+            count,
+        )
+        return _selected_call(call, "tl.ascend_cast_raw_counter").args[-1]
+
+    for count in [tir.const(0, "uint64"), tir.const((1 << 32) - 1, "uint64"), tir.Var("count", "uint64")]:
+        assert_structural_equal(selected_count(count), count)
+
+    for value in [-1, 1 << 32, 1 << 63, UINT64_MASK]:
+        count = tir.const(value, "int64" if value < 0 else "uint64")
+        with pytest.raises(Exception, match=r"must be in \[0, 4294967295\]"):
+            selected_count(count)
 
 
 def test_effect_only_variants_share_terminals_and_compute_contextual_contracts():
