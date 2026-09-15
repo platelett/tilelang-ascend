@@ -16,6 +16,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/runtime/registry.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
@@ -62,17 +63,34 @@ void ValidateCounterConstant(const PrimExpr &value, const std::string &name) {
       << simplified;
 }
 
-void ValidateRepeatConstant(const PrimExpr &value, const std::string &name) {
-  arith::Analyzer analyzer;
-  PrimExpr simplified = analyzer.Simplify(value);
-  const auto *constant = simplified.as<IntImmNode>();
-  ICHECK(constant != nullptr)
-      << name << " must be a compile-time constant in [0, 255], got "
-      << simplified;
-  ICHECK_GE(constant->value, 0)
-      << name << " must be in [0, 255], got " << simplified;
-  ICHECK_LE(constant->value, 255)
-      << name << " must be in [0, 255], got " << simplified;
+void ValidateConstantRange(const PrimExpr &value, uint64_t maximum,
+                           const std::string &name) {
+  auto valid = [&](bool condition) {
+    ICHECK(condition) << name << " must be in [0, " << maximum << "], got "
+                      << value;
+  };
+  if (const auto *constant = value.as<IntImmNode>()) {
+    valid(constant->value >= 0 &&
+          static_cast<uint64_t>(constant->value) <= maximum);
+  } else if (const auto *constant = value.as<CallNode>();
+             constant && constant->op.same_as(builtin::large_uint_imm())) {
+    ICHECK_EQ(constant->args.size(), 2U);
+    const auto *lo = constant->args[0].as<IntImmNode>();
+    const auto *hi = constant->args[1].as<IntImmNode>();
+    ICHECK(lo && hi);
+    uint64_t integer =
+        static_cast<uint32_t>(lo->value) |
+        (static_cast<uint64_t>(static_cast<uint32_t>(hi->value)) << 32);
+    valid(integer <= maximum);
+  }
+}
+
+size_t NormalMaskArgument(const AscendVectorSemanticOpSpec &semantic) {
+  return semantic.base.same_as(ascend_block_reduce_max()) ||
+                 semantic.base.same_as(ascend_block_reduce_min()) ||
+                 semantic.base.same_as(ascend_block_reduce_sum())
+             ? 3
+             : 2;
 }
 
 bool IsCopyUbToUb(const CallNode *call) {
@@ -301,7 +319,14 @@ void ValidateTerminalBufferDTypes(const ResolvedSemanticCall &resolved,
   case OperandRecipe::kScalar:
     ValidateSameBufferDTypes(resolved, args, {0, 1});
     if (IsAccessPtr(args[2])) {
-      ValidateSameBufferDTypes(resolved, args, {0, 2});
+      DataType dtype = VectorAccessPtrDtype(args[0]);
+      bool transformed_float_scalar =
+          (resolved.semantic->base.same_as(ascend_divs()) ||
+           resolved.semantic->base.same_as(ascend_subs())) &&
+          (dtype == DataType::Float(16) || dtype == DataType::Float(32));
+      if (!transformed_float_scalar) {
+        ValidateSameBufferDTypes(resolved, args, {0, 2});
+      }
     }
     return;
   case OperandRecipe::kAxpy:
@@ -566,6 +591,14 @@ ResolveSemanticCall(const Call &call,
       int64_t m = std::stoll(params[1]);
       int64_t n = std::stoll(params[2]);
       int64_t dim = std::stoll(params[3]);
+      DataType dtype = VectorDType(call->args);
+      ICHECK(!dtype.is_void());
+      ICHECK_LE(n, 256 / dtype.bytes())
+          << "narrow reduce needs the logical width to fit one vector repeat "
+             "(256 bytes)";
+      ICHECK(!is_zero(call->args[layout.clear_index]))
+          << "narrow reduce cannot merge into the destination (clear == "
+             "false); reduce into a scratch and combine.";
       int64_t lanes = dim == -1 ? n : (dim == 0 ? m : m * n);
       auto [lo, hi] = NormalMaskBits(lanes);
       payload = {lo, hi};
@@ -573,26 +606,20 @@ ResolveSemanticCall(const Call &call,
     break;
   }
   case SelectorRecipe::kNormalMaskArg: {
-    size_t mask_index =
-        semantic.base.same_as(ascend_block_reduce_max()) ||
-                semantic.base.same_as(ascend_block_reduce_min()) ||
-                semantic.base.same_as(ascend_block_reduce_sum())
-            ? 3
-            : 2;
+    size_t mask_index = NormalMaskArgument(semantic);
     PrimExpr mask = analyzer->Simplify(call->args[mask_index]);
-    const auto *constant = mask.as<IntImmNode>();
     DataType dtype = VectorDType(call->args);
     ICHECK(!dtype.is_void());
     int64_t max_lanes = 256 / dtype.bytes();
-    ICHECK(constant && constant->value >= 0 && constant->value <= max_lanes)
-        << "NORMAL mask length for " << dtype << " must be a constant in [0, "
-        << max_lanes << "]";
+    ValidateConstantRange(mask, max_lanes,
+                          "NORMAL mask length for " +
+                              runtime::DLDataType2String(dtype));
     size_t repeat_index = mask_index == 3 ? 2 : 3;
-    ValidateRepeatConstant(call->args[repeat_index],
-                           std::string(semantic.base->name) + " repeat");
+    ValidateConstantRange(analyzer->Simplify(call->args[repeat_index]), 255,
+                          std::string(semantic.base->name) + " repeat");
     variant = FindVariant(semantic, SelectorRecipe::kNormalMaskArg);
-    auto [lo, hi] = NormalMaskBits(constant->value);
-    payload = {lo, hi};
+    auto [lo, hi] = NormalMaskBits(mask);
+    payload = {analyzer->Simplify(lo), analyzer->Simplify(hi)};
     break;
   }
   case SelectorRecipe::kBroadcastComposite:
@@ -715,6 +742,26 @@ private:
       spec = AscendVectorSemanticSpecOf(semantic);
     }
     if (spec != nullptr) {
+      if (spec->variants.front().selector == SelectorRecipe::kNormalMaskArg) {
+        size_t mask_index = NormalMaskArgument(*spec);
+        ICHECK_LT(mask_index, semantic->args.size());
+        PrimExpr mask = semantic->args[mask_index];
+        if (SideEffect(mask) != CallEffectKind::kPure) {
+          // Sample a memory-backed mask once at the original call site. The
+          // payload words and terminal share this binding, which also bounds
+          // the lifetime of any reusable mask facts.
+          Var sampled_mask("normal_mask_length", mask.dtype());
+          Array<PrimExpr> args = semantic->args;
+          args.Set(mask_index, sampled_mask);
+          Call sampled(semantic->dtype, semantic->op, std::move(args),
+                       semantic->span);
+          return LetStmt(sampled_mask, mask,
+                         Evaluate(SelectCall(sampled.get(),
+                                             ResolveSemanticCall(sampled, *spec,
+                                                                 &analyzer_)),
+                                  op->span));
+        }
+      }
       return Evaluate(
           SelectCall(call, ResolveSemanticCall(semantic, *spec, &analyzer_)),
           op->span);

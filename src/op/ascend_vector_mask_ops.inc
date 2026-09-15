@@ -219,8 +219,6 @@ TL_ASCEND_FIXED_HELPER(ascend_fill_experiment_explicit_mask,
                        ascend_fill_experiment, 7, kNormalExplicitLowArg)
 TL_ASCEND_COMPOSITE_HELPER(ascend_sum_experiment_composite,
                            ascend_sum_experiment, 6)
-TL_ASCEND_NEUTRAL_HELPER(ascend_datacachecleanandinvalid_experiment_neutral,
-                         ascend_datacachecleanandinvalid_experiment, 2)
 TL_ASCEND_FIXED_HELPER(ascend_brcb_experiment_payload_full,
                        ascend_brcb_experiment, 6, kPayloadFull)
 

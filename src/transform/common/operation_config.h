@@ -336,7 +336,7 @@ GetOperationConfig() {
       {"tl.ascend_fill_experiment", {{{1, "write"}}, "PIPE_V"}},
       {"tl.ascend_sum_experiment", {{{1, "write"}, {2, "read"}}, "PIPE_V"}},
       {"tl.ascend_datacachecleanandinvalid_experiment",
-       {{{1, "write"}}, "PIPE_V"}},
+       {{{1, "write"}}, "PIPE_S"}},
       {"tl.ascend_brcb_experiment", {{{1, "write"}, {2, "read"}}, "PIPE_V"}},
       {"tl.ascend_row_expand_mul_experiment",
        {{{1, "write"}, {2, "read"}, {3, "read"}}, "PIPE_V"}},

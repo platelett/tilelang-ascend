@@ -180,7 +180,22 @@ MaskContract ContractOf(const Call &call, arith::Analyzer *analyzer) {
       return NormalMaskBits(lanes->value);
     }
     ICHECK(semantic.base.same_as(ascend_gather_mask_experiment()));
-    return {analyzer->Simplify(semantic_args[5]), ZeroPayload()};
+    // Match the helper's uint32_t mask argument before recording its state.
+    // Fold literals here: TVM's cast folder does not truncate large integers.
+    PrimExpr mask = analyzer->Simplify(semantic_args[5]);
+    if (const auto *imm = mask.as<IntImmNode>()) {
+      mask = make_const(DataType::UInt(64), static_cast<uint32_t>(imm->value));
+    } else if (const auto *imm = mask.as<CallNode>();
+               imm && imm->op.same_as(builtin::large_uint_imm())) {
+      ICHECK_EQ(imm->args.size(), 2U);
+      ICHECK(imm->args[0].as<IntImmNode>() && imm->args[1].as<IntImmNode>());
+      mask = make_const(
+          DataType::UInt(64),
+          static_cast<uint32_t>(Downcast<IntImm>(imm->args[0])->value));
+    } else {
+      mask = cast(DataType::UInt(64), cast(DataType::UInt(32), mask));
+    }
+    return {analyzer->Simplify(mask), ZeroPayload()};
   };
   MaskContract contract;
   if (semantic.base.same_as(tir::builtin::call_extern())) {
@@ -255,16 +270,16 @@ MaskContract ContractOf(const Call &call, arith::Analyzer *analyzer) {
     return contract;
   }
   case ContractRecipe::kCreateVecIndex: {
-    const auto *count = semantic_args.back().as<IntImmNode>();
-    if (count == nullptr || dtype.is_void()) {
-      return MaskContract{AnyUnknown(), AnyUnknown(), AnyUnknown()};
-    }
-    // The one-block path uses scalar stores. Larger constants enter a
-    // count-form Adds helper which restores NORMAL and both full words.
-    if (count->value <= 32 / dtype.bytes()) {
+    PrimExpr count_expr = analyzer->Simplify(semantic_args.back());
+    const auto *count = count_expr.as<IntImmNode>();
+    // The one-block path only uses scalar stores. Other paths can enter
+    // mask-form Adds, which needs NORMAL mode and leaves a partial payload.
+    if (count != nullptr && !dtype.is_void() && count->value >= 0 &&
+        count->value <= 32 / dtype.bytes()) {
       return contract;
     }
-    return NormalFullPostState();
+    contract.mode = ExactExact(ModeValue(AscendMaskMode::kNormal));
+    return UnknownPostState(contract);
   }
   case ContractRecipe::kGatherCount: {
     // Gather programs a NORMAL payload for its element count, but its dav-c220
@@ -302,7 +317,8 @@ bool CallMayAffectVectorMask(const Call &call) {
   if (IsVectorMaskSetter(call)) {
     return true;
   }
-  if (call->op.same_as(ascend_pipe_barrier()) ||
+  if (call->op.same_as(ascend_datacachecleanandinvalid_experiment()) ||
+      call->op.same_as(ascend_pipe_barrier()) ||
       call->op.same_as(ascend_sync_all()) ||
       call->op.same_as(ascend_set_flag()) ||
       call->op.same_as(ascend_wait_flag()) ||

@@ -160,6 +160,7 @@ private:
 
 DataType VectorAccessPtrDtype(const PrimExpr &expr);
 std::pair<PrimExpr, PrimExpr> NormalMaskBits(int64_t lanes);
+std::pair<PrimExpr, PrimExpr> NormalMaskBits(const PrimExpr &lanes);
 
 bool UseCompilerManagedVectorMask(const Target &target,
                                   const std::string &platform);

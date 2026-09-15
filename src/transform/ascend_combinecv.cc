@@ -620,6 +620,16 @@ AscendResource ResourceForStorageScope(const std::string &scope) {
   return AscendResource::kNone;
 }
 
+AscendResource ResourceForBufferStore(const BufferStoreNode *store) {
+  // GM scalar stores keep the established Cube ownership. Per-core scalar
+  // state has no fixed owner: outer local/local.var assignments are shared
+  // computations and must accompany the control flow on both generated sides.
+  if (store->buffer.scope() == "global") {
+    return AscendResource::kCube;
+  }
+  return ResourceForStorageScope(store->buffer.scope());
+}
+
 std::string NormalizePipeName(std::string pipe) {
   std::transform(pipe.begin(), pipe.end(), pipe.begin(),
                  [](unsigned char ch) { return std::toupper(ch); });
@@ -757,8 +767,19 @@ AscendResource ResourceForCall(const CallNode *call, std::string *operation) {
 
   if (call->op.same_as(ascend_printf()) ||
       call->op.same_as(ascend_sync_all()) ||
-      call->op.same_as(ascend_use_swizzle())) {
+      call->op.same_as(ascend_use_swizzle()) ||
+      call->op.same_as(loop_break())) {
     return AscendResource::kCommon;
+  }
+  if (call->op.same_as(ascend_datacachecleanandinvalid_experiment())) {
+    ICHECK_EQ(call->args.size(), 2U);
+    std::string scope = StorageScopeForAccessPtr(call->args[1]);
+    ICHECK(scope == "global" || scope == "shared.ub")
+        << "DataCacheCleanAndInvalid requires a GM or UB operand";
+    // A GM address does not identify whose scalar cache needs maintenance.
+    // Its owner must come from explicit scope or sufficient surrounding work.
+    return scope == "shared.ub" ? AscendResource::kVector
+                                : AscendResource::kExplicit;
   }
   if (call->op.same_as(ascend_src_code())) {
     return AscendResource::kExplicit;
@@ -859,7 +880,11 @@ AscendResource ResourceForCall(const CallNode *call, std::string *operation) {
   return AscendResource::kNone;
 }
 
-bool IsContextDependentSyncCall(const CallNode *call) {
+bool IsContextDependentResourceCall(const CallNode *call) {
+  if (call->op.same_as(ascend_datacachecleanandinvalid_experiment())) {
+    return call->args.size() == 2 &&
+           StorageScopeForAccessPtr(call->args[1]) == "global";
+  }
   if (call->op.same_as(ascend_pipe_barrier())) {
     if (call->args.empty()) {
       return false;
@@ -881,7 +906,8 @@ bool IsContextDependentSyncCall(const CallNode *call) {
 
 struct ResourceSummary {
   AscendResource resource{AscendResource::kNone};
-  bool has_context_sync{false};
+  bool has_context_operation{false};
+  bool has_shared_gm_read{false};
 };
 
 bool IsConcreteResource(AscendResource resource) {
@@ -893,7 +919,7 @@ class ExactResourceCollector final : public StmtExprVisitor {
 public:
   ResourceSummary Collect(const Stmt &stmt) {
     VisitStmt(stmt);
-    return {resource_, has_context_sync_};
+    return {resource_, has_context_operation_, has_shared_gm_read_};
   }
 
 private:
@@ -914,23 +940,34 @@ private:
   }
 
   void VisitExpr_(const CallNode *op) final {
-    if (IsContextDependentSyncCall(op)) {
-      has_context_sync_ = true;
+    if (IsContextDependentResourceCall(op)) {
+      has_context_operation_ = true;
       return;
     }
     std::string operation;
-    Add(ResourceForCall(op, &operation));
+    AscendResource resource = ResourceForCall(op, &operation);
+    Add(resource);
+    bool saved_owned_expression = owned_expression_;
+    owned_expression_ |= IsConcreteResource(resource);
     StmtExprVisitor::VisitExpr_(op);
+    owned_expression_ = saved_owned_expression;
   }
 
   void VisitExpr_(const BufferLoadNode *op) final {
     Add(ResourceForStorageScope(op->buffer.scope()));
+    if (!owned_expression_ && op->buffer.scope() == "global") {
+      has_shared_gm_read_ = true;
+    }
     StmtExprVisitor::VisitExpr_(op);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    Add(ResourceForStorageScope(op->buffer.scope()));
+    AscendResource resource = ResourceForBufferStore(op);
+    Add(resource);
+    bool saved_owned_expression = owned_expression_;
+    owned_expression_ |= IsConcreteResource(resource);
     StmtExprVisitor::VisitStmt_(op);
+    owned_expression_ = saved_owned_expression;
   }
 
   void VisitStmt_(const ForNode *op) final {
@@ -956,14 +993,16 @@ private:
   }
 
   AscendResource resource_{AscendResource::kNone};
-  bool has_context_sync_{false};
+  bool has_context_operation_{false};
+  bool has_shared_gm_read_{false};
+  bool owned_expression_{false};
 };
 
 ResourceSummary SummarizeResources(const Stmt &stmt) {
   return ExactResourceCollector().Collect(stmt);
 }
 
-bool IsContextDependentSync(const Stmt &stmt) {
+bool IsContextDependentResource(const Stmt &stmt) {
   const auto *evaluate = stmt.as<EvaluateNode>();
   if (evaluate == nullptr) {
     return false;
@@ -972,7 +1011,7 @@ bool IsContextDependentSync(const Stmt &stmt) {
   if (call == nullptr) {
     return false;
   }
-  return IsContextDependentSyncCall(call);
+  return IsContextDependentResourceCall(call);
 }
 
 AscendResource RegionResource(const std::vector<ResourceSummary> &summaries) {
@@ -1001,7 +1040,7 @@ AscendResource NearestResource(const std::vector<ResourceSummary> &summaries,
   return AscendResource::kNone;
 }
 
-class ContextualSyncResolver final : public StmtMutator {
+class ContextualResourceResolver final : public StmtMutator {
   Stmt VisitStmt_(const SeqStmtNode *op) final {
     std::vector<ResourceSummary> summaries;
     summaries.reserve(op->seq.size());
@@ -1010,6 +1049,10 @@ class ContextualSyncResolver final : public StmtMutator {
     }
 
     AscendResource saved_context = context_;
+    bool saved_shared_gm_read = shared_gm_read_;
+    for (const ResourceSummary &summary : summaries) {
+      shared_gm_read_ |= summary.has_shared_gm_read;
+    }
     AscendResource region = RegionResource(summaries);
     AscendResource sequence_context = saved_context;
     if (IsConcreteResource(region)) {
@@ -1023,7 +1066,7 @@ class ContextualSyncResolver final : public StmtMutator {
         child_context = summaries[i].resource;
       } else if (!IsConcreteResource(child_context) &&
                  summaries[i].resource == AscendResource::kNone &&
-                 summaries[i].has_context_sync) {
+                 summaries[i].has_context_operation) {
         AscendResource before =
             NearestResource(summaries, static_cast<int>(i) - 1, -1);
         AscendResource after =
@@ -1036,19 +1079,60 @@ class ContextualSyncResolver final : public StmtMutator {
       seq.push_back(VisitStmt(op->seq[i]));
     }
     context_ = saved_context;
+    shared_gm_read_ = saved_shared_gm_read;
     return SeqStmt(seq, op->span);
+  }
+
+  template <typename Node>
+  Stmt VisitWithSharedReads(const Node *op,
+                            const Array<PrimExpr> &expressions) {
+    bool saved_shared_gm_read = shared_gm_read_;
+    for (const PrimExpr &expression : expressions) {
+      shared_gm_read_ |=
+          SummarizeResources(Evaluate(expression)).has_shared_gm_read;
+    }
+    Stmt stmt = StmtMutator::VisitStmt_(op);
+    shared_gm_read_ = saved_shared_gm_read;
+    return stmt;
+  }
+
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    return VisitWithSharedReads(op, {op->value});
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    return VisitWithSharedReads(op, {op->min, op->extent});
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    return VisitWithSharedReads(op, {op->condition});
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    return VisitWithSharedReads(op, {op->condition});
+  }
+
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+    return VisitWithSharedReads(op, {op->predicate});
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == "resource_scope") {
       return GetRef<Stmt>(op);
     }
-    return StmtMutator::VisitStmt_(op);
+    return VisitWithSharedReads(op, {op->value});
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     Stmt stmt = StmtMutator::VisitStmt_(op);
-    if (!IsContextDependentSync(stmt) || !IsConcreteResource(context_)) {
+    if (!IsContextDependentResource(stmt) || !IsConcreteResource(context_)) {
+      return stmt;
+    }
+    const auto *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
+    if (call->op.same_as(ascend_datacachecleanandinvalid_experiment()) &&
+        shared_gm_read_) {
+      // Outer scalar GM reads execute on both sides. Compute/DMA ownership
+      // alone cannot establish which of those caches the program must maintain.
       return stmt;
     }
     int64_t scope = context_ == AscendResource::kVector ? 1 : 0;
@@ -1057,6 +1141,7 @@ class ContextualSyncResolver final : public StmtMutator {
   }
 
   AscendResource context_{AscendResource::kNone};
+  bool shared_gm_read_{false};
 };
 
 class AscendResourceScopeVerifier final : public StmtExprVisitor {
@@ -1148,24 +1233,6 @@ class CVCombineEmitter : public StmtMutator {
 public:
   explicit CVCombineEmitter(bool is_aiv) : is_aiv_(is_aiv) {}
 
-  Stmt VisitStmt_(const ForNode *op) final {
-    Stmt new_stmt = StmtMutator::VisitStmt_(op);
-
-    const ForNode *new_for = new_stmt.as<ForNode>();
-    if (!new_for) {
-      return new_stmt;
-    }
-
-    Stmt new_body = new_for->body;
-    // Recursively check if the body is effectively empty
-    // (e.g., BlockRealize with only alloc_buffers and Evaluate(0))
-    if (IsEmptyBody(new_body)) {
-      return Evaluate(0);
-    }
-
-    return new_stmt;
-  }
-
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key != "resource_scope") {
       return StmtMutator::VisitStmt_(op);
@@ -1178,42 +1245,8 @@ public:
     ++explicit_scope_depth_;
     Stmt body = VisitStmt(op->body);
     --explicit_scope_depth_;
-    return body;
-  }
-
-  bool IsEmptyBody(const Stmt &stmt) {
-    if (const auto *eval = stmt.as<EvaluateNode>()) {
-      if (const auto *int_imm = eval->value.as<IntImmNode>()) {
-        return int_imm->value == 0;
-      }
-    }
-    if (const auto *alloc = stmt.as<AllocateNode>()) {
-      return IsEmptyBody(alloc->body);
-    }
-    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
-      // Check if block only has allocations and no actual statements
-      return IsEmptyBody(realize->block->body);
-    }
-    if (const auto *block = stmt.as<BlockNode>()) {
-      // Block may have alloc_buffers, but we only care about the body
-      return IsEmptyBody(block->body);
-    }
-    if (const auto *if_then_else = stmt.as<IfThenElseNode>()) {
-      bool then_empty = IsEmptyBody(if_then_else->then_case);
-      bool else_empty = if_then_else->else_case.defined()
-                            ? IsEmptyBody(if_then_else->else_case.value())
-                            : true;
-      return then_empty && else_empty;
-    }
-    if (const auto *seq = stmt.as<SeqStmtNode>()) {
-      for (const auto &s : seq->seq) {
-        if (!IsEmptyBody(s)) {
-          return false;
-        }
-      }
-      return true;
-    }
-    return false;
+    // Keep distinct explicit blocks distinct, including opaque C++ locals.
+    return AttrStmt(op->node, op->attr_key, op->value, body, op->span);
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -1232,34 +1265,32 @@ public:
     if (resource == AscendResource::kCube ||
         resource == AscendResource::kVector) {
       bool keep = (resource == AscendResource::kVector) == is_aiv_;
-      current_process_enabled_ = keep;
       return keep ? StmtMutator::VisitStmt_(op) : Evaluate(0);
     }
     ICHECK(resource != AscendResource::kExplicit)
         << "Unscoped opaque Ascend operation cannot be classified by "
            "CombineCV; place it in an explicit T.Scope: "
         << operation;
-    return current_process_enabled_ ? StmtMutator::VisitStmt_(op) : Evaluate(0);
+    // Resource-neutral scalar/control statements belong to the shared outer
+    // program, not to the preceding hardware operation. Retain their enclosing
+    // loops/branches too; later passes may safely remove genuinely empty work.
+    return StmtMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     if (explicit_scope_depth_ > 0) {
       return StmtMutator::VisitStmt_(op);
     }
-    AscendResource resource = ResourceForStorageScope(op->buffer.scope());
+    AscendResource resource = ResourceForBufferStore(op);
     if (resource == AscendResource::kNone) {
-      // Preserve the established CombineCV convention for scalar/global
-      // stores. Their resource-specific inputs are classified separately.
-      resource = AscendResource::kCube;
+      return StmtMutator::VisitStmt_(op);
     }
     bool keep = (resource == AscendResource::kVector) == is_aiv_;
-    current_process_enabled_ = keep;
     return keep ? StmtMutator::VisitStmt_(op) : Evaluate(0);
   }
 
 private:
   const bool is_aiv_;
-  bool current_process_enabled_{false};
   int explicit_scope_depth_{0};
 };
 
@@ -1277,7 +1308,7 @@ public:
     }
 
     PrimFuncNode *fptr = f.CopyOnWrite();
-    fptr->body = ContextualSyncResolver()(fptr->body);
+    fptr->body = ContextualResourceResolver()(fptr->body);
     // Reject opaque outer calls and conflicting explicit scopes before the
     // split can discard their original context.
     AscendResourceScopeVerifier::Verify(f, false);

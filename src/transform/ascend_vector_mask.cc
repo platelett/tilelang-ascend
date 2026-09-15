@@ -140,6 +140,31 @@ std::pair<PrimExpr, PrimExpr> NormalMaskBits(int64_t lanes) {
           word(std::max<int64_t>(lanes - 64, 0))};
 }
 
+std::pair<PrimExpr, PrimExpr> NormalMaskBits(const PrimExpr &lanes) {
+  if (const auto *constant = lanes.as<IntImmNode>()) {
+    return NormalMaskBits(constant->value);
+  }
+  ICHECK((lanes.dtype().is_int() || lanes.dtype().is_uint()) &&
+         lanes.dtype().lanes() == 1)
+      << "NORMAL mask length must be an integer scalar, got " << lanes;
+  PrimExpr length = cast(DataType::Int(64), lanes);
+  PrimExpr zero = make_zero(DataType::UInt(64));
+  PrimExpr full =
+      make_const(DataType::UInt(64), std::numeric_limits<uint64_t>::max());
+  // Both branches are safe even if a later simplifier evaluates them eagerly:
+  // the only shift is always in [0, 63], including lengths 0, 64, and 128.
+  // Keep the partial word signed and nonnegative until its final cast so the
+  // pinned TVM can fold it without constructing an oversized uint64 IntImm.
+  PrimExpr width = bitwise_and(length, make_const(DataType::Int(64), 63));
+  PrimExpr partial =
+      cast(DataType::UInt(64),
+           right_shift(make_const(DataType::Int(64),
+                                  std::numeric_limits<int64_t>::max()),
+                       63 - width));
+  return {Select(length >= 64, full, partial),
+          Select(length <= 64, zero, Select(length >= 128, full, partial))};
+}
+
 SelectedCallView::SelectedCallView(Call selected)
     : selected_(std::move(selected)) {
   std::optional<SelectedTerminalRef> resolved = SelectedTerminalOf(selected_);

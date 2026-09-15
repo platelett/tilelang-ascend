@@ -509,8 +509,15 @@ void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
 }
 
 void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
-  if (op->op.same_as(tl::ascend_set_mask_mode()) ||
-      op->op.same_as(tl::ascend_set_mask_payload())) {
+  if (op->op.same_as(builtin::large_uint_imm())) {
+    ICHECK_EQ(op->args.size(), 2U);
+    uint64_t low = static_cast<uint32_t>(Downcast<IntImm>(op->args[0])->value);
+    uint64_t high = static_cast<uint32_t>(Downcast<IntImm>(op->args[1])->value);
+    std::ostringstream literal;
+    literal << "0x" << std::hex << ((high << 32U) | low) << "ULL";
+    os << literal.str();
+  } else if (op->op.same_as(tl::ascend_set_mask_mode()) ||
+             op->op.same_as(tl::ascend_set_mask_payload())) {
     ICHECK(current_resource_scope_ == 1)
         << "Compiler-managed Vector-mask setter appeared outside an explicit "
            "AIV resource scope";
@@ -548,6 +555,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     } else if (op_name == "npu.fill") {
       this->PrintIndent();
     }
+  } else if (op->op.same_as(tl::ascend_datacachecleanandinvalid_experiment())) {
+    CreateDatacacheExperimentCodegen(op);
   } else if (EmitVectorHelper(op->op, op)) {
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
@@ -2855,9 +2864,6 @@ bool CodeGenTileLangAscend::EmitVectorHelper(const ObjectRef &semantic_op,
     FillExperimentCodegen(op);
   } else if (semantic_op.same_as(tl::ascend_sum_experiment())) {
     SumExperimentCodegen(op);
-  } else if (semantic_op.same_as(
-                 tl::ascend_datacachecleanandinvalid_experiment())) {
-    CreateDatacacheExperimentCodegen(op);
   } else if (semantic_op.same_as(tl::ascend_brcb_experiment())) {
     BrcbExperimentCodegen(op);
   } else {
@@ -2947,8 +2953,18 @@ void CodeGenTileLangAscend::EmitSelectedRawScalar(
   this->PrintIndent();
   this->stream << "{\n";
   const auto *access = semantic_args[2].as<CallNode>();
-  if (access && access->op.same_as(builtin::tvm_access_ptr())) {
-    ICHECK_EQ(scalar_dtype, GetAccessPtrDtype(access));
+  const bool scalar_access =
+      access && access->op.same_as(builtin::tvm_access_ptr());
+  const bool transformed_scalar =
+      view.variant().emitter == tl::EmitterFamily::kRawSubs ||
+      view.variant().emitter == tl::EmitterFamily::kRawDivs;
+  const bool promote_scalar_access =
+      scalar_access && transformed_scalar &&
+      (dtype.is_float16() || dtype == DataType::Float(32));
+  if (scalar_access) {
+    if (!promote_scalar_access) {
+      ICHECK_EQ(scalar_dtype, GetAccessPtrDtype(access));
+    }
     std::string buffer = PrintBufferOffset(access, false);
     this->PrintIndent();
     this->stream << "AscendC::PipeBarrier<PIPE_ALL>();\n";
@@ -2957,15 +2973,21 @@ void CodeGenTileLangAscend::EmitSelectedRawScalar(
     this->stream << "auto " << scalar << " = " << buffer << ".GetValue("
                  << PrintExpr(semantic_args[semantic_args.size() - 2])
                  << ");\n";
+  } else if (transformed_scalar) {
+    // Negate or take the reciprocal before converting the scalar's type.
+    scalar = PrintExpr(semantic_args[2]);
   } else {
     scalar = CoerceScalarArg(semantic_args[2], scalar_dtype);
   }
   if (view.variant().emitter == tl::EmitterFamily::kRawSubs) {
-    scalar = dtype.is_float16() ? "half(-(float)(" + scalar + "))"
-                                : "-(" + scalar + ")";
+    std::string value =
+        promote_scalar_access ? "(float)(" + scalar + ")" : "(" + scalar + ")";
+    scalar = getType(dtype) + "(-(" + value + "))";
   } else if (view.variant().emitter == tl::EmitterFamily::kRawDivs) {
-    scalar = dtype.is_float16() ? "half(1.0f / (float)(" + scalar + "))"
-                                : "1.0f / (float)(" + scalar + ")";
+    std::string divisor =
+        scalar_access ? "(float)(" + scalar + ")" : "(" + scalar + ")";
+    std::string reciprocal = "1.0f / " + divisor;
+    scalar = dtype.is_float16() ? "half(" + reciprocal + ")" : reciprocal;
   }
   args.push_back(scalar);
   args.push_back("AscendC::MASK_PLACEHOLDER");

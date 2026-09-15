@@ -5,7 +5,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget
-from tvm import IRModule, get_global_func, tir
+from tvm import DataType, IRModule, arith, get_global_func, tir
 from tvm.ir import Op
 from tvm.target import Target
 
@@ -35,6 +35,26 @@ def _integer_value(expr: tir.PrimExpr) -> int:
     if isinstance(expr, tir.Call) and _name(expr) == "tir.large_uint_imm":
         return int(expr.args[0].value) | (int(expr.args[1].value) << 32)
     raise TypeError(f"Expected an integer literal, got {expr}")
+
+
+def _evaluate_mask_word(expr: tir.PrimExpr) -> int:
+    """Evaluate the constant integer AST left by TVM's partial simplifier."""
+    if isinstance(expr, tir.Cast):
+        dtype = DataType(expr.dtype)
+        assert dtype.type_code in [0, 1] and dtype.lanes == 1
+        value = _evaluate_mask_word(expr.value) & ((1 << dtype.bits) - 1)
+        if dtype.type_code == 0 and value >= 1 << (dtype.bits - 1):
+            value -= 1 << dtype.bits
+        return value
+    if isinstance(expr, tir.Sub):
+        return _evaluate_mask_word(expr.a) - _evaluate_mask_word(expr.b)
+    if isinstance(expr, tir.Call) and _name(expr) in ["tir.bitwise_and", "tir.shift_right"]:
+        lhs, rhs = [_evaluate_mask_word(arg) for arg in expr.args]
+        if _name(expr) == "tir.bitwise_and":
+            return lhs & rhs
+        assert 0 <= rhs < DataType(expr.args[0].dtype).bits
+        return lhs >> rhs
+    return _integer_value(expr)
 
 
 def _names(node) -> list[str | None]:
@@ -185,6 +205,7 @@ def test_catalog_is_closed_and_all_terminals_are_registered():
     names = list(get_global_func("tl.transform.AscendVectorTerminalCatalog")())
     assert names
     assert len(names) == len(set(names))
+    assert not any("datacachecleanandinvalid" in name for name in names)
     for name in names:
         assert Op.get(name).name == name
 
@@ -312,6 +333,12 @@ def test_effect_only_variants_share_terminals_and_compute_contextual_contracts()
         ),
         "tl.ascend_gather_mask_experiment_self_contained",
     )
+    for mask in [tir.const(UINT64_MASK, "uint64"), tir.const(0x1FFFFFFFF, "uint64")]:
+        args = list(gather_mask_experiment.args)
+        args[5] = mask
+        narrowed = tir.Call(gather_mask_experiment.dtype, gather_mask_experiment.op, args)
+        assert _setter_counts(_legalize_calls(narrowed, _selected_add(32))) == (0, 0)
+        assert _setter_counts(_legalize_calls(narrowed, _selected_add(64))) == (0, 1)
     fp16_add = _call(
         "tl.ascend_add",
         _access("float16", "fp16_dst", 128, 2),
@@ -364,22 +391,158 @@ def test_non_natural_capabilities_are_checked_before_selection():
             "tl.ascend_block_reduce_max",
             _access("float32", "reduce_dst", access_mask=2),
             _access("float32", "reduce_src", access_mask=1),
-            *[_int(value) for value in (repeat, mask, 1, 1, 8)],
+            *[value if isinstance(value, tir.PrimExpr) else _int(value) for value in (repeat, mask, 1, 1, 8)],
         )
 
-    dynamic_repeat = block_reduce(1, 64)
-    dynamic_repeat = tir.Call(
-        dynamic_repeat.dtype,
-        dynamic_repeat.op,
-        [*dynamic_repeat.args[:2], tir.Var("repeat", "int32"), *dynamic_repeat.args[3:]],
-    )
     for call, message in [
         (block_reduce(1, 65), r"float32.*\[0, 64\]"),
         (block_reduce(256, 64), r"repeat must be in \[0, 255\]"),
-        (dynamic_repeat, r"repeat must be a compile-time constant"),
+        (block_reduce(-1, 64), r"repeat must be in \[0, 255\]"),
+        (block_reduce(tir.const(UINT64_MASK, "uint64"), 64), r"repeat must be in \[0, 255\]"),
+        (block_reduce(1, tir.const(UINT64_MASK, "uint64")), r"float32.*\[0, 64\]"),
     ]:
         with pytest.raises(Exception, match=message):
             _selected_call(call, "tl.ascend_block_reduce_max_raw_normal")
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("operation", ["block_reduce_max", "wholereducesum"])
+def test_dynamic_normal_mask_and_repeat_preserve_exact_state(dtype, operation):
+    length = tir.Var("length", "int32")
+    repeat = tir.Var("repeat", "int32")
+    mask_index = 3 if operation.startswith("block") else 2
+    repeat_index = 2 if mask_index == 3 else 3
+
+    def selected(mask):
+        shape = [repeat, mask] if mask_index == 3 else [mask, repeat]
+        call = _call(
+            f"tl.ascend_{operation}",
+            _access(dtype, "reduce_dst", access_mask=2),
+            _access(dtype, "reduce_src", access_mask=1),
+            *shape,
+            *[_int(value) for value in (1, 1, 8)],
+        )
+        return _selected_call(call, f"tl.ascend_{operation}_raw_normal")
+
+    first = selected(length)
+    assert first.args[repeat_index].same_as(repeat)
+    # Equivalent pure expressions retain one exact setup across both calls.
+    result = _legalize_calls(first, selected(length + 0))
+    assert _setter_counts(result) == (1, 1)
+    analyzer = arith.Analyzer()
+    max_lanes = 128 if dtype == "float16" else 64
+    for lanes in [0, 1, 63, 64, 65, 127, 128]:
+        if lanes > max_lanes:
+            continue
+        words = [analyzer.simplify(tir.stmt_functor.substitute(word, {length: _int(lanes)})) for word in first.args[-2:]]
+        assert [_evaluate_mask_word(word) for word in words] == [
+            (1 << min(lanes, 64)) - 1,
+            (1 << max(lanes - 64, 0)) - 1,
+        ]
+
+    template = _add_program(max_lanes, dtype)
+
+    def replace(call):
+        if _name(call) == "tl.ascend_add":
+            shape = [repeat, length] if mask_index == 3 else [length, repeat]
+            return _call(f"tl.ascend_{operation}", call.args[0], call.args[1], *shape, *[_int(value) for value in (1, 1, 8)])
+
+    body = tir.stmt_functor.ir_transform(template.body, None, replace, ["tir.Call"])
+    program = tir.PrimFunc([*template.params, length, repeat], body, buffer_map=template.buffer_map, attrs=template.attrs)
+    source = tilelang.lower(program, target="ascendc", platform="A2").kernel_source
+    assert "0xffffffffffffffffULL" in source
+    assert "18446744073709551615" not in source
+
+
+def test_buffer_loaded_normal_mask_is_sampled_once():
+    counts = tir.decl_buffer((1,), "int32", name="counts")
+    load = tir.BufferLoad(counts, [0])
+    call = _call(
+        "tl.ascend_block_reduce_max",
+        _access("float16", "reduce_dst", access_mask=2),
+        _access("float16", "reduce_src", access_mask=1),
+        _int(1),
+        load,
+        *[_int(value) for value in (1, 1, 8)],
+    )
+    selected = _select(_with_body(_add_fp32, tir.Evaluate(call)))
+    binding = selected.body.body
+    assert isinstance(binding, tir.LetStmt) and binding.value.same_as(load)
+    terminal = binding.body.value
+    assert terminal.args[3].same_as(binding.var)
+    for word in terminal.args[-2:]:
+        variables = []
+        tir.stmt_functor.post_order_visit(
+            word, lambda node, variables=variables: variables.append(node) if isinstance(node, tir.Var) else None
+        )
+        assert any(variable.same_as(binding.var) for variable in variables)
+    result = _legalize(selected)
+    loads = []
+    tir.stmt_functor.post_order_visit(result.body, lambda node: loads.append(node) if isinstance(node, tir.BufferLoad) else None)
+    assert len(loads) == 1 and loads[0].same_as(load)
+    assert _setter_counts(result) == (1, 1)
+
+
+@pytest.mark.parametrize(("width", "clear", "message"), [(32, False, "cannot merge"), (96, True, "fit one vector repeat")])
+def test_narrow_reduce_retains_unsupported_case_rejections(width, clear, message):
+    @T.prim_func
+    def main(a: T.Tensor((16, 128), "float32"), out: T.Tensor((16,), "float32")):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a_ub = T.alloc_ub((16, 128), "float32")
+            out_ub = T.alloc_ub((16,), "float32")
+            with T.Scope("V"):
+                T.copy(a, a_ub)
+                T.reduce_max(a_ub[:, :width], out_ub, dim=-1, clear=clear)
+                T.copy(out_ub, out)
+
+    with pytest.raises(Exception, match=message):
+        tilelang.lower(main, target="ascendc", platform="A2")
+
+
+def test_mixed_scalar_buffers_are_specific_to_floating_divs_and_subs():
+    def scalar_call(operation, vector_dtype="float16"):
+        return _call(
+            f"tl.ascend_{operation}",
+            _access(vector_dtype, "scalar_dst", access_mask=2),
+            _access(vector_dtype, "scalar_src", access_mask=1),
+            _access("float32", "scalar_value", access_mask=1),
+            _int(0),
+            _int(64),
+        )
+
+    for operation in ["divs", "subs"]:
+        selected = _selected_call(scalar_call(operation), f"tl.ascend_{operation}_raw")
+        assert selected.args[2].args[0].value == "float32"
+    for call in [scalar_call("adds"), scalar_call("subs", "int16")]:
+        with pytest.raises(Exception, match="Unsupported AscendC Vector dtype tuple"):
+            _select(_with_body(_add_fp32, tir.Evaluate(call)))
+
+
+def test_createvecindex_requires_normal_and_discards_vector_post_state():
+    for count, expected in [(_int(8), (1, 1)), (_int(64), (3, 2)), (tir.Var("count", "int32"), (3, 2))]:
+        helper = _selected_call(
+            _call(
+                "tl.ascend_createvecindex",
+                tir.StringImm("CreateVecIndex<float>"),
+                _access("float32", "index_dst", access_mask=2),
+                tir.FloatImm("float32", 0.0),
+                count,
+            ),
+            "tl.ascend_createvecindex_unknown",
+        )
+        following = _selected_add(96 if isinstance(count, tir.IntImm) and count.value == 8 else 64)
+        assert _setter_counts(_legalize_calls(_selected_add(96), helper, following)) == expected
+
+
+def test_dcci_stays_unselected_and_mask_neutral():
+    call = _call(
+        "tl.ascend_datacachecleanandinvalid_experiment",
+        tir.StringImm("AscendC::DataCacheCleanAndInvalid"),
+        _access("float32", "cache"),
+    )
+    selected = _select(_with_body(_add_fp32, tir.Evaluate(call)))
+    assert _names(selected.body) == _names(call)
+    assert _setter_counts(_legalize_calls(_selected_add(64), call, _selected_add(64))) == (1, 1)
 
 
 def test_legalizer_reuses_state_and_repairs_transitions():

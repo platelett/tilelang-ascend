@@ -121,8 +121,9 @@ call is allowed only inside an explicit C/V scope; an unscoped unknown call fail
 of inheriting the classification of an adjacent operation. An opaque call inside V scope
 invalidates known mask facts.
 
-Only known context-dependent synchronization may use surrounding statements as evidence. For
-`barrier_all` or a local event whose MTE2/MTE3 pipes do not identify one owner, `CombineCV`
+Known context-dependent synchronization and GM cache maintenance may use surrounding statements
+as evidence. For `barrier_all`, a local event whose MTE2/MTE3 pipes do not identify one owner, or
+GM `datacachecleanandinvalid_experiment`, `CombineCV`
 recursively summarizes the resource-specific work in each sequence, branch, loop, and block. It
 assigns the synchronization to C or V only when the containing region is otherwise pure, or when
 the nearest concrete statements on both sides have the same exact owner. A C/V boundary, mixed or
@@ -183,6 +184,11 @@ by earlier operations and inserts only the missing repair:
 | either payload word differs | one payload setter that writes both words |
 | mode and payload differ | both setters |
 
+Mask words can be scalar TIR expressions: a runtime value is not inherently unknown. Block/whole
+reductions accept dynamic repeat counts and mask lengths; compile-time-known values are checked
+against their dtype and instruction bounds. Dynamic inputs retain the underlying API's value
+constraints without an added runtime check. The public DSL has no standalone mask setter.
+
 Facts are retained only when every possible runtime path proves them. `if` branches use a must-fact
 merge; mask-affecting loops are entered and exited with unknown state; facts that mention a local
 binding are dropped when the binding ends. Unknown calls and opaque source injection invalidate
@@ -232,8 +238,8 @@ When adding or changing a managed operation:
    and emitter.
 3. Verify every entry requirement and every exit path against the exact helper or CANN
    implementation. Audit mode and both payload words, including zero-work and runtime branches.
-4. Reject unsupported counts, masks, repeats, strides, dtypes, and shapes before the CANN call is
-   emitted; do not rely on debug-only CANN checks or integer narrowing.
+4. Reject known-invalid counts, masks, repeats, strides, dtypes, and shapes before the CANN call is
+   emitted. Preserve supported runtime parameters; unknown values alone are not invalid inputs.
 5. Confirm the shared CombineCV/verifier classifier identifies the semantic and selected forms as
    Vector work; do not add a second ownership rule inside Selection or Legalize.
 6. Add focused tests in `testing/python/language/test_tilelang_ascend_vector_mask.py` for selection,
