@@ -60,6 +60,7 @@ Important outputs:
 PlanAndUpdateBufferAllocationLocation
   -> CrossCorePipeline
   -> CombineCV
+  -> PlanAndUpdateBufferAllocationLocation
   -> PipelinePlanning
   -> InjectSoftwarePipeline
   -> AscendLowerOpaqueBlock

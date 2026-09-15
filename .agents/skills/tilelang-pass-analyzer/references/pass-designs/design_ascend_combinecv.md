@@ -22,8 +22,8 @@ operations classified as common, but not unowned local hardware work.
 ## 2. One shared classifier
 
 `CombineCV` and `AscendResourceScopeVerify` both call `ResourceForCall()`. Never add a second
-substring table. Unknown or opaque work cannot inherit an adjacent statement's owner; only the
-known context-dependent synchronization described below may use surrounding statements.
+substring table. Unknown or opaque work cannot inherit an adjacent statement's owner; only known
+context-dependent operations (synchronization and GM DCCI) may use surrounding statements.
 
 ```cpp
 enum class AscendResource {
@@ -75,9 +75,9 @@ last-writer-wins classification.
 - Vector-mask setters, selected managed Vector terminals, and set-deq-scale are Vector.
 - `set_flag` / `wait_flag` use their directed pipe pair.
 - pipe barriers, cross flags, and auto barriers use their pipe argument.
-- `barrier_all` and a local event whose MTE2/MTE3 pair has no unique owner are context-dependent;
-  with CombineCV enabled, they are assigned only inside an otherwise pure C/V region or between
-  two nearest concrete statements with the same owner.
+- `barrier_all`, local MTE2/MTE3 events without a unique owner, and GM DCCI use context.
+  With CombineCV, require a pure C/V region or equal nearest owners on both sides;
+  shared GM scalar reads prevent automatic GM DCCI ownership.
 - A normalized `call_extern` name is looked up in `GetOperationConfig()`; access pointers then
   cross-check or disambiguate the result.
 - An unknown `tl.ascend_*` call may be classified from classifiable access pointers; without
@@ -96,8 +96,8 @@ When enabled:
 ```text
 input tilelang_root
     |
-    +-- resolve known context-dependent synchronization
-    |     pure region or equal two-sided owner -> internal matching scope
+    +-- resolve known context-dependent operations
+    |     sufficient single-owner context -> internal matching scope
     |
     +-- pre-verify with require_explicit_scope=false
     |     reject conflicting nested scopes
@@ -117,10 +117,9 @@ input tilelang_root
 Common operations are intentionally retained in both branches. Explicit C/V scope bodies enter
 only their matching emitter and are not reclassified statement by statement.
 
-For historical scalar/global stores in the outer Developer form, the emitter keeps the established
-Cube-side convention. Local UB/L1/L0 stores are resource-specific and classified from storage.
-The strict late verifier checks both BufferStore and BufferLoad, including accesses in conditions
-or other expressions.
+Unscoped GM scalar stores retain the historical Cube owner. Shared local/local.var assignments
+are retained in both branches; UB/L1/L0 stores follow their local storage owner. Explicit stores
+retain their declared scope. The late verifier checks loads and stores, including expressions.
 
 ## 4. AscendResourceScopeVerify
 

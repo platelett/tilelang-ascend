@@ -71,7 +71,7 @@
 **核心方法：**
 - `ResourceForCall()` - 按 operation contract、pipe 参数和 access pointer 分类
 - `MergeResources()` - 交叉校验 operation resource 与 local buffer resource
-- `ContextualSyncResolver` - 只给 pure region / 同 owner 双侧证据中的已知歧义 sync 补 scope
+- `ContextualResourceResolver` - 为有充分 C/V 上下文证据的同步和 GM DCCI 补 scope
 - `VisitStmt_(BlockRealizeNode)` - 找到 tilelang_root，创建 C/V 两个 Emitter
 - `CVCombineEmitter` - common 两侧保留、C/V 单侧保留、opaque fail closed
 
