@@ -470,15 +470,14 @@ void ValidateSelectedDType(const ResolvedSemanticCall &resolved,
            "families.";
     arith::Analyzer analyzer;
     PrimExpr count = analyzer.Simplify(args.back());
-    const auto *constant = count.as<IntImmNode>();
     int64_t lanes_per_repeat = dtype.bits() == 16 ? 128 : 64;
     int64_t max_count = 256 * lanes_per_repeat - 1;
-    ICHECK(constant != nullptr && constant->value >= 0 &&
-           constant->value <= max_count)
-        << "AscendC Gather count must be a compile-time constant in [0, "
-        << max_count << "] for " << dtype
-        << "; dav-c220 narrows count / lanes to uint8_t and would silently "
-           "truncate a larger or unbounded count.";
+    ValidateConstantRange(count, max_count, "AscendC Gather count");
+  }
+  if (resolved.semantic->base.same_as(ascend_bilinear_interpolation())) {
+    arith::Analyzer analyzer;
+    ValidateConstantRange(analyzer.Simplify(args[4]), 128,
+                          "AscendC BilinearInterpolation mask");
   }
   if (resolved.variant->operands == OperandRecipe::kAxpy) {
     ICHECK_GE(args.size(), 2U);
@@ -733,15 +732,21 @@ private:
       spec = AscendVectorSemanticSpecOf(semantic);
     }
     if (spec != nullptr) {
-      if (spec->variants.front().selector == SelectorRecipe::kNormalMaskArg) {
-        size_t mask_index = NormalMaskArgument(*spec);
+      bool normal_mask =
+          spec->variants.front().selector == SelectorRecipe::kNormalMaskArg;
+      bool bilinear = spec->base.same_as(ascend_bilinear_interpolation());
+      bool gather = spec->base.same_as(ascend_gather());
+      if (normal_mask || bilinear || gather) {
+        size_t mask_index = normal_mask ? NormalMaskArgument(*spec)
+                            : bilinear  ? 4
+                                        : semantic->args.size() - 1;
         ICHECK_LT(mask_index, semantic->args.size());
         PrimExpr mask = semantic->args[mask_index];
         if (SideEffect(mask) != CallEffectKind::kPure) {
-          // Sample a memory-backed mask once at the original call site. The
-          // payload words and terminal share this binding, which also bounds
-          // the lifetime of any reusable mask facts.
-          Var sampled_mask("normal_mask_length", mask.dtype());
+          // Sample memory-backed mask/count values once at the call site.
+          // The terminal and its mask facts share this scoped binding.
+          Var sampled_mask(gather ? "gather_count" : "normal_mask_length",
+                           mask.dtype());
           Array<PrimExpr> args = semantic->args;
           args.Set(mask_index, sampled_mask);
           Call sampled(semantic->dtype, semantic->op, std::move(args),

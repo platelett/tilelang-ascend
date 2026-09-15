@@ -633,6 +633,9 @@ AscendResource ResourceForBufferStore(const BufferStoreNode *store) {
 std::string NormalizePipeName(std::string pipe) {
   std::transform(pipe.begin(), pipe.end(), pipe.begin(),
                  [](unsigned char ch) { return std::toupper(ch); });
+  if (pipe.rfind("PIPE_", 0) == 0) {
+    pipe.erase(0, 5);
+  }
   return pipe;
 }
 

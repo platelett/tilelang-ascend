@@ -408,7 +408,7 @@ def test_non_natural_capabilities_are_checked_before_selection():
         _selected_call(gather("uint8", 8), "tl.ascend_gather_count")
 
     assert _name(_selected_call(gather("float32", 16383), "tl.ascend_gather_count")) == ("tl.ascend_gather_count")
-    with pytest.raises(Exception, match="compile-time constant in.*16383"):
+    with pytest.raises(Exception, match=r"Gather count must be in \[0, 16383\]"):
         _selected_call(gather("float32", 16384), "tl.ascend_gather_count")
 
     def block_reduce(repeat, mask):
@@ -428,6 +428,92 @@ def test_non_natural_capabilities_are_checked_before_selection():
     ]:
         with pytest.raises(Exception, match=message):
             _selected_call(call, "tl.ascend_block_reduce_max_raw_normal")
+
+
+def _gather_with_count(count, dtype="float32"):
+    return _call(
+        "tl.ascend_gather",
+        _access(dtype, "gather_dst", access_mask=2),
+        _access(dtype, "gather_src", access_mask=1),
+        _access("uint32", "gather_offsets", access_mask=1),
+        _int(0),
+        count,
+    )
+
+
+def _bilinear_with_mask(mask):
+    return _call(
+        "tl.ascend_bilinear_interpolation",
+        _access("float16", "bilinear_dst", 256, 2),
+        _access("float16", "bilinear_src", 512, 1),
+        _access("uint32", "bilinear_offsets", 32, 1),
+        _access("float16", "bilinear_weights", 16, 1),
+        mask,
+        _int(2),
+        _int(0, "bool"),
+        _int(1),
+        _int(128),
+        _int(2),
+        _access("float16", "bilinear_tmp", 512),
+    )
+
+
+@pytest.mark.parametrize(
+    "operation,make_call,index,maximum",
+    [
+        ("gather", _gather_with_count, 4, 16383),
+        ("bilinear_interpolation", _bilinear_with_mask, 4, 128),
+    ],
+)
+def test_helper_dynamic_parameters_and_constant_bounds(operation, make_call, index, maximum):
+    value = tir.Var("value", "uint64")
+    for expr in [_int(0), _int(maximum), value]:
+        selected = _select(_with_body(_add_fp32, tir.Evaluate(make_call(expr))))
+        terminal = next(c for c in _calls(selected.body) if operation in (_name(c) or ""))
+        assert_structural_equal(terminal.args[index], expr)
+    for invalid in [_int(-1), _int(maximum + 1), tir.const(UINT64_MASK, "uint64")]:
+        with pytest.raises(Exception, match="must be in"):
+            _select(_with_body(_add_fp32, tir.Evaluate(make_call(invalid))))
+
+    values = tir.decl_buffer((1,), "int32", name="values")
+    load = tir.BufferLoad(values, [0])
+    selected = _select(_with_body(_add_fp32, tir.Evaluate(make_call(load))))
+    binding = selected.body.body
+    assert isinstance(binding, tir.LetStmt)
+    assert_structural_equal(binding.value, load)
+    assert binding.body.value.args[index].same_as(binding.var)
+
+
+def test_bilinear_dynamic_mask_is_tracked_exactly():
+    mask = tir.Var("mask", "int32")
+    bilinear = _selected_call(_bilinear_with_mask(mask), "tl.ascend_bilinear_interpolation_self_contained")
+    reduce = _selected_call(
+        _call(
+            "tl.ascend_block_reduce_max",
+            _access("float16", "dst", access_mask=2),
+            _access("float16", "src", access_mask=1),
+            _int(1),
+            mask,
+            _int(1),
+            _int(1),
+            _int(8),
+        ),
+        "tl.ascend_block_reduce_max_raw_normal",
+    )
+    # The helper already established both words required by the next operation.
+    assert _setter_counts(_legalize_calls(bilinear, reduce)) == (0, 0)
+
+
+@pytest.mark.parametrize("dtype,lanes", [("float16", 128), ("float32", 64)])
+def test_gather_preserves_zero_count_and_tracks_tail(dtype, lanes):
+    full_half = _selected_add_for(_add_program(128, "float16"), 128)
+    zero = _selected_call(_gather_with_count(_int(0), dtype), "tl.ascend_gather_count")
+    # Even a float32 Gather must preserve the nonzero high word when count=0.
+    assert _setter_counts(_legalize_calls(full_half, zero, full_half)) == (1, 1)
+    for count, tail in [(lanes, lanes), (lanes + 1, 1)]:
+        gather = _selected_call(_gather_with_count(_int(count), dtype), "tl.ascend_gather_count")
+        following = _selected_add_for(_add_program(lanes, dtype), tail)
+        assert _setter_counts(_legalize_calls(gather, following)) == (1, 0)
 
 
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
@@ -975,6 +1061,66 @@ def test_codegen_compiles_conditional_count():
         out_idx=[1],
         pass_configs={tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True},
     )
+
+
+def test_codegen_compiles_dynamic_gather_count():
+    @T.prim_func
+    def main(a: T.Tensor((64,), "float32"), indices: T.Tensor((64,), "uint32"), out: T.Tensor((64,), "float32"), n: T.int32):
+        with T.Kernel(1, threads=1, is_npu=True):
+            src = T.alloc_ub((64,), "float32")
+            offsets = T.alloc_ub((64,), "uint32")
+            dst = T.alloc_ub((64,), "float32")
+            with T.Scope("V"):
+                T.copy(a, src)
+                T.copy(indices, offsets)
+                T.tile.fill(dst, 0)
+                if T.And(n >= 0, n <= 64):
+                    T.tile.gather(dst[:n], src, offsets[:n], 0)
+                T.copy(dst, out)
+
+    tilelang.disable_cache()
+    tilelang.compile(main, target="ascendc", platform="A2", out_idx=[2], pass_configs={tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True})
+
+
+def test_codegen_compiles_dynamic_bilinear_mask():
+    @T.prim_func
+    def main(
+        a: T.Tensor((1, 512), "float16"),
+        indices: T.Tensor((1, 32), "uint32"),
+        weights: T.Tensor((1, 16), "float16"),
+        out: T.Tensor((1, 256), "float16"),
+        n: T.int32,
+    ):
+        with T.Kernel(1, threads=1, is_npu=True):
+            src = T.alloc_ub((1, 512), "float16")
+            offsets = T.alloc_ub((1, 32), "uint32")
+            scale = T.alloc_ub((1, 16), "float16")
+            dst = T.alloc_ub((1, 256), "float16")
+            with T.Scope("V"):
+                T.copy(a, src)
+                T.copy(indices, offsets)
+                T.copy(weights, scale)
+                T.tile.fill(dst, 0)
+                if T.And(n >= 1, n <= 128):
+                    T.tile.bilinear_interpolation(dst, src, offsets, scale, n, 2, False, 1, 128, 2)
+                T.copy(dst, out)
+
+    tilelang.disable_cache()
+    tilelang.compile(main, target="ascendc", platform="A2", out_idx=[3], pass_configs={tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True})
+
+
+@pytest.mark.parametrize("pipe,owner", [("PIPE_V", 1), ("PIPE_MTE1", 0)])
+def test_resource_scope_checks_automatic_barriers(pipe, owner):
+    verify = tilelang.transform.AscendResourceScopeVerify()
+    body = tir.Evaluate(_call("tl.ascend_auto_barrier", tir.StringImm(pipe)))
+    for scope in [owner, 1 - owner]:
+        function = _with_body(_add_fp32, tir.AttrStmt(_int(0), "resource_scope", scope, body), scoped=False)
+        module = IRModule({"main": function})
+        if scope == owner:
+            verify(module)
+        else:
+            with pytest.raises(Exception, match="operation must be inside T.Scope"):
+                verify(module)
 
 
 def test_codegen_uses_raw_false_overloads_and_reuses_mask_state():

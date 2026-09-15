@@ -205,6 +205,12 @@ entry. Explicit-mask `FillExperiment` has the same requirement. The analysis als
 architectural payload: a 32-bit operation that writes the high word to zero must publish that zero
 because a later 16-bit operation observes it.
 
+Gather counts and BilinearInterpolation mask lengths may be runtime expressions; only known
+constants receive range checks. BilinearInterpolation publishes its exact mask expression.
+Gather conditionally updates each known payload word, preserving the incoming value when no
+instruction executes (including a zero count). Memory-backed parameters are sampled once at the
+call site so that the operation and its tracked state use the same value.
+
 ## Operation catalog and code generation
 
 `src/op/ascend_vector_mask_ops.inc` is the declarative catalog for managed Vector operations. A

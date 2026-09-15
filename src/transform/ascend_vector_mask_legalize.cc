@@ -175,9 +175,7 @@ MaskContract ContractOf(const Call &call, arith::Analyzer *analyzer) {
       return {selected.mask_lo(), selected.mask_hi()};
     }
     if (semantic.base.same_as(ascend_bilinear_interpolation())) {
-      const auto *lanes = analyzer->Simplify(semantic_args[4]).as<IntImmNode>();
-      ICHECK(lanes && lanes->value >= 0 && lanes->value <= 128);
-      return NormalMaskBits(lanes->value);
+      return NormalMaskBits(analyzer->Simplify(semantic_args[4]));
     }
     ICHECK(semantic.base.same_as(ascend_gather_mask_experiment()));
     // Match the helper's uint32_t mask argument before recording its state.
@@ -282,22 +280,9 @@ MaskContract ContractOf(const Call &call, arith::Analyzer *analyzer) {
     return UnknownPostState(contract);
   }
   case ContractRecipe::kGatherCount: {
-    // Gather programs a NORMAL payload for its element count, but its dav-c220
-    // Level-0 path does not switch the mask mode.  Require NORMAL on entry and
-    // publish the payload that Gather leaves behind.
-    const auto *count = semantic_args.back().as<IntImmNode>();
-    if (count == nullptr || dtype.is_void() || count->value <= 0) {
-      return {ExactExact(ModeValue(AscendMaskMode::kNormal)), AnyUnknown(),
-              AnyUnknown()};
-    }
-    int64_t lanes_per_repeat = dtype.bits() == 16 ? 128 : 64;
-    int64_t final_lanes = count->value % lanes_per_repeat;
-    if (final_lanes == 0) {
-      final_lanes = lanes_per_repeat;
-    }
-    auto [lo, hi] = NormalMaskBits(final_lanes);
-    return {ExactExact(ModeValue(AscendMaskMode::kNormal)), AnyExact(lo),
-            AnyExact(hi)};
+    // Gather preserves mode. Its conditional payload writes are applied with
+    // the incoming facts in ApplyGather, including the zero-work path.
+    return {ExactExact(ModeValue(AscendMaskMode::kNormal)), {}, {}};
   }
   case ContractRecipe::kNormalExplicitLowArg:
     ICHECK_GE(semantic_args.size(), 4U);
@@ -450,6 +435,9 @@ private:
         MaskFacts cast_post{AscendMaskMode::kNormal, FullPayload(),
                             FullPayload()};
         facts_ = Meet(facts_, cast_post);
+      } else if (selected.variant().helper_contract ==
+                 ContractRecipe::kGatherCount) {
+        ApplyGather(selected);
       } else if (copy_effect != RuntimeStridedCopyEffect::kPreserve) {
         Apply(contract);
       }
@@ -619,6 +607,36 @@ private:
     } else if (field.ensure == MaskEnsure::kUnknown) {
       fact->reset();
     }
+  }
+
+  void ApplyGather(const SelectedCallView &selected) {
+    // Match the helper's uint32 count and uint8 repeat conversion. Only its
+    // tail or a nonzero converted repeat issues a mask-setting instruction.
+    PrimExpr count = analyzer_.Simplify(
+        cast(DataType::Int(64),
+             cast(DataType::UInt(32), selected.semantic_args().back())));
+    int64_t lanes = selected.vector_dtype().bits() == 16 ? 128 : 64;
+    PrimExpr tail = bitwise_and(count, make_const(count.dtype(), lanes - 1));
+    PrimExpr writes =
+        bitwise_and(count, make_const(count.dtype(), 256 * lanes - 1)) != 0;
+    if (analyzer_.CanProve(!writes)) {
+      return;
+    }
+    auto [lo, hi] = NormalMaskBits(analyzer_.Simplify(
+        Select(tail != 0, tail, make_const(count.dtype(), lanes))));
+    auto update = [&](std::optional<PrimExpr> *known, const PrimExpr &payload) {
+      if (analyzer_.CanProve(writes)) {
+        *known = ReusablePayload(payload);
+      } else if (known->has_value()) {
+        // No payload setter is needed just to model the zero-work path.
+        // COUNTER facts may retain the count's original integer dtype.
+        *known = ReusablePayload(analyzer_.Simplify(
+            Select(writes, payload, cast(payload.dtype(), **known))));
+      }
+      // Unknown incoming words stay unknown when the no-write path is possible.
+    };
+    update(&facts_.lo, lo);
+    update(&facts_.hi, hi);
   }
 
   void Apply(const MaskContract &contract) {
