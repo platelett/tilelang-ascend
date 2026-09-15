@@ -953,6 +953,30 @@ def test_codegen_accepts_conditional_scalar(operation):
     assert "condition" in source and "} else {" in source
 
 
+def test_codegen_compiles_conditional_count():
+    @T.prim_func
+    def main(a: T.Tensor((64,), "float32"), out: T.Tensor((64,), "float32"), choose: T.int32):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a_ub = T.alloc_ub((64,), "float32")
+            out_ub = T.alloc_ub((64,), "float32")
+            with T.Scope("V"):
+                T.copy(a, a_ub)
+                T.tile.fill(out_ub, 0)
+                n = T.if_then_else(choose > 0, 32, 64)
+                T.tile.exp(out_ub[:n], a_ub[:n])
+                T.copy(out_ub, out)
+
+    # Lowering alone returned malformed C++ for the conditional mask count.
+    tilelang.disable_cache()
+    tilelang.compile(
+        main,
+        target="ascendc",
+        platform="A2",
+        out_idx=[1],
+        pass_configs={tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True},
+    )
+
+
 def test_codegen_uses_raw_false_overloads_and_reuses_mask_state():
     tilelang.disable_cache()
     normal = tilelang.compile(_two_adds, target="ascendc", platform="A2", out_idx=[2])

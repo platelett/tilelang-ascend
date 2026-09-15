@@ -3183,11 +3183,11 @@ void CodeGenTileLangAscend::EmitSelectedRawClamp(
 }
 
 void CodeGenTileLangAscend::MaskSetterCodegen(const CallNode *op) {
-  this->PrintIndent();
   if (op->op.same_as(tl::ascend_set_mask_mode())) {
     ICHECK_EQ(op->args.size(), 1U);
     const auto *mode = op->args[0].as<IntImmNode>();
     ICHECK(mode && (mode->value == 0 || mode->value == 1));
+    this->PrintIndent();
     this->stream << (mode->value == 0 ? "AscendC::SetMaskNorm();\n"
                                       : "AscendC::SetMaskCount();\n");
     return;
@@ -3213,9 +3213,12 @@ void CodeGenTileLangAscend::MaskSetterCodegen(const CallNode *op) {
     }
     return PrintExpr(value);
   };
-  this->stream << "AscendC::SetVectorMask<uint8_t>("
-               << print_payload(op->args[1]) << ", "
-               << print_payload(op->args[0]) << ");\n";
+  // Expressions may emit prerequisite statements before yielding their value.
+  const std::string high = print_payload(op->args[1]);
+  const std::string low = print_payload(op->args[0]);
+  this->PrintIndent();
+  this->stream << "AscendC::SetVectorMask<uint8_t>(" << high << ", " << low
+               << ");\n";
 }
 
 } // namespace codegen
