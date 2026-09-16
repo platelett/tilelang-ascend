@@ -228,13 +228,31 @@ private:
       const bool may_be_empty = !analyzer_->CanProve(extent > 0);
       auto entry_history =
           may_be_empty ? current_access_history_ : AccessHistory{};
+      const std::string loop_id = Downcast<StringImm>(op->value)->value;
+      loop_exit_states_.push_back({loop_id, AccessHistory{}, false});
       Stmt new_body = VisitStmt(op->body);
+      ICHECK(loop_exit_states_.back().first_iteration_seen)
+          << "Missing first iteration exit for " << loop_id;
+      // The second simulated iteration discovers back-edge handoffs. Its
+      // additional completion facts need not hold when the real loop executes
+      // only once. The first exit is the conservative invariant for all
+      // positive trip counts; rebuilding must preserve both bodies' handoffs.
+      current_access_history_ =
+          std::move(loop_exit_states_.back().first_iteration_history);
+      loop_exit_states_.pop_back();
       if (may_be_empty) {
         JoinAccessHistories(entry_history);
       }
       return AttrStmt(op->node, op->attr_key, op->value, new_body);
-    } else if (op->attr_key == "iteration_start" ||
-               op->attr_key == "iteration_end") {
+    } else if (op->attr_key == "iteration_end") {
+      ICHECK(!loop_exit_states_.empty());
+      auto &loop = loop_exit_states_.back();
+      if (Downcast<StringImm>(op->value)->value == loop.loop_id + "_iter1") {
+        loop.first_iteration_history = current_access_history_;
+        loop.first_iteration_seen = true;
+      }
+      return GetRef<Stmt>(op);
+    } else if (op->attr_key == "iteration_start") {
       return GetRef<Stmt>(op);
     }
 
@@ -567,77 +585,236 @@ private:
     MergeStatementSequences(const std::vector<Stmt> &iter1_stmts,
                             const std::vector<Stmt> &iter2_stmts,
                             const std::string &loop_id) {
-      std::vector<Stmt> merged_stmts;
-      std::vector<Stmt> exec_stmts;
-      std::vector<std::vector<Stmt>> syncs_before_execs;
+      struct Sequence {
+        std::vector<Stmt> operations;
+        std::vector<std::vector<Stmt>> syncs{1};
+      };
+      auto split = [&](const std::vector<Stmt> &stmts) {
+        Sequence result;
+        for (const auto &stmt : stmts) {
+          if (IsSyncStatement(stmt)) {
+            result.syncs.back().push_back(stmt);
+          } else if (!IsMarkerStatement(stmt) && !IsEmptyEvaluate(stmt)) {
+            result.operations.push_back(stmt);
+            result.syncs.emplace_back();
+          }
+        }
+        return result;
+      };
+      auto first = split(iter1_stmts);
+      auto second = split(iter2_stmts);
+      ICHECK_EQ(first.operations.size(), second.operations.size())
+          << "Loop synchronization changed the operation count in " << loop_id;
 
-      std::vector<Stmt> current_syncs;
-      for (const auto &stmt : iter1_stmts) {
-        if (IsSyncStatement(stmt)) {
-          current_syncs.push_back(stmt);
-        } else if (!IsMarkerStatement(stmt)) {
-          exec_stmts.push_back(stmt);
-          syncs_before_execs.push_back(current_syncs);
-          current_syncs.clear();
+      std::vector<Stmt> merged;
+      for (size_t i = 0; i <= first.operations.size(); ++i) {
+        auto syncs = MergeSyncSequences(first.syncs[i], second.syncs[i]);
+        merged.insert(merged.end(), syncs.begin(), syncs.end());
+        if (i < first.operations.size()) {
+          merged.push_back(MergeCorrespondingStatements(
+              first.operations[i], second.operations[i], loop_id));
         }
       }
+      return merged;
+    }
 
-      if (!current_syncs.empty()) {
-        syncs_before_execs.push_back(current_syncs);
-        current_syncs.clear();
+    Stmt MergeBodies(const Stmt &first, const Stmt &second,
+                     const std::string &loop_id) {
+      auto merged = MergeStatementSequences(FlattenStmts(first),
+                                            FlattenStmts(second), loop_id);
+      if (merged.empty()) {
+        return Evaluate(0);
       }
+      return merged.size() == 1 ? merged[0] : SeqStmt(merged);
+    }
 
-      std::vector<std::vector<Stmt>> iter2_syncs_before_execs(
-          exec_stmts.size());
-      size_t exec_index = 0;
-      for (const auto &stmt : iter2_stmts) {
-        if (IsSyncStatement(stmt)) {
-          if (exec_index < iter2_syncs_before_execs.size()) {
-            iter2_syncs_before_execs[exec_index].push_back(stmt);
+    template <typename T>
+    Stmt MergeBodyStatement(const Stmt &first, const Stmt &second,
+                            const std::string &loop_id) {
+      T left = Downcast<T>(first);
+      T right = Downcast<T>(second);
+      T metadata = right;
+      metadata.CopyOnWrite()->body = left->body;
+      ICHECK(StructuralEqual()(left, metadata));
+      T result = left;
+      result.CopyOnWrite()->body =
+          MergeBodies(left->body, right->body, loop_id);
+      return result;
+    }
+
+    Stmt MergeCorrespondingStatements(const Stmt &first, const Stmt &second,
+                                      const std::string &loop_id) {
+      ICHECK_EQ(first->type_index(), second->type_index());
+      // Both copies originate from the same execution statement. Preserve its
+      // metadata, but merge nested bodies instead of discarding the second
+      // copy's loop-carried synchronization.
+      if (first.as<ForNode>()) {
+        return MergeBodyStatement<For>(first, second, loop_id);
+      }
+      if (const auto *op = first.as<IfThenElseNode>()) {
+        const auto *other = second.as<IfThenElseNode>();
+        IfThenElse metadata = Downcast<IfThenElse>(second);
+        metadata.CopyOnWrite()->then_case = op->then_case;
+        metadata.CopyOnWrite()->else_case = op->else_case;
+        ICHECK(StructuralEqual()(first, metadata));
+        IfThenElse result = Downcast<IfThenElse>(first);
+        auto *node = result.CopyOnWrite();
+        node->then_case = MergeBodies(op->then_case, other->then_case, loop_id);
+        ICHECK_EQ(op->else_case.defined(), other->else_case.defined());
+        if (op->else_case.defined()) {
+          node->else_case = MergeBodies(op->else_case.value(),
+                                        other->else_case.value(), loop_id);
+        }
+        return result;
+      }
+      if (first.as<LetStmtNode>()) {
+        return MergeBodyStatement<LetStmt>(first, second, loop_id);
+      }
+      if (first.as<AttrStmtNode>()) {
+        return MergeBodyStatement<AttrStmt>(first, second, loop_id);
+      }
+      if (first.as<AllocateNode>()) {
+        return MergeBodyStatement<Allocate>(first, second, loop_id);
+      }
+      if (first.as<AllocateConstNode>()) {
+        return MergeBodyStatement<AllocateConst>(first, second, loop_id);
+      }
+      if (first.as<DeclBufferNode>()) {
+        return MergeBodyStatement<DeclBuffer>(first, second, loop_id);
+      }
+      if (first.as<AssertStmtNode>()) {
+        return MergeBodyStatement<AssertStmt>(first, second, loop_id);
+      }
+      if (first.as<BufferRealizeNode>()) {
+        return MergeBodyStatement<BufferRealize>(first, second, loop_id);
+      }
+      if (first.as<WhileNode>()) {
+        return MergeBodyStatement<While>(first, second, loop_id);
+      }
+      if (const auto *op = first.as<BlockRealizeNode>()) {
+        BlockRealize metadata = Downcast<BlockRealize>(second);
+        metadata.CopyOnWrite()->block = op->block;
+        ICHECK(StructuralEqual()(first, metadata));
+        BlockRealize result = Downcast<BlockRealize>(first);
+        result.CopyOnWrite()->block =
+            Downcast<Block>(MergeCorrespondingStatements(
+                op->block, second.as<BlockRealizeNode>()->block, loop_id));
+        return result;
+      }
+      if (const auto *op = first.as<BlockNode>()) {
+        const auto *other = second.as<BlockNode>();
+        Block metadata = Downcast<Block>(second);
+        metadata.CopyOnWrite()->body = op->body;
+        metadata.CopyOnWrite()->init = op->init;
+        ICHECK(StructuralEqual()(first, metadata));
+        Block result = Downcast<Block>(first);
+        auto *node = result.CopyOnWrite();
+        node->body = MergeBodies(op->body, other->body, loop_id);
+        ICHECK_EQ(op->init.defined(), other->init.defined());
+        if (op->init.defined()) {
+          node->init =
+              MergeBodies(op->init.value(), other->init.value(), loop_id);
+        }
+        return result;
+      }
+      ICHECK(StructuralEqual()(first, second))
+          << "Loop synchronization changed an execution statement in "
+          << loop_id;
+      return first;
+    }
+
+    bool IsMatchingEventPair(const Stmt &set, const Stmt &wait) {
+      const auto *set_eval = set.as<EvaluateNode>();
+      const auto *wait_eval = wait.as<EvaluateNode>();
+      if (!set_eval || !wait_eval) {
+        return false;
+      }
+      const auto *set_call = set_eval->value.as<CallNode>();
+      const auto *wait_call = wait_eval->value.as<CallNode>();
+      if (!set_call || !wait_call) {
+        return false;
+      }
+      size_t offset = 0;
+      if (set_call->op.same_as(builtin::call_extern()) &&
+          wait_call->op.same_as(builtin::call_extern())) {
+        const auto *set_name = set_call->args[0].as<StringImmNode>();
+        const auto *wait_name = wait_call->args[0].as<StringImmNode>();
+        if (!set_name || !wait_name ||
+            std::string(set_name->value).find("AutoSetFlag") ==
+                std::string::npos ||
+            std::string(wait_name->value).find("AutoWaitFlag") ==
+                std::string::npos) {
+          return false;
+        }
+        offset = 1;
+      } else if (!set_call->op.same_as(tl::ascend_auto_set_flag()) ||
+                 !wait_call->op.same_as(tl::ascend_auto_wait_flag())) {
+        return false;
+      }
+      return set_call->args.size() == offset + 2 &&
+             wait_call->args.size() == offset + 2 &&
+             StructuralEqual()(set_call->args[offset],
+                               wait_call->args[offset]) &&
+             StructuralEqual()(set_call->args[offset + 1],
+                               wait_call->args[offset + 1]);
+    }
+
+    std::vector<Stmt> MergeSyncSequences(const std::vector<Stmt> &first,
+                                         const std::vector<Stmt> &second) {
+      using SyncUnit = std::vector<Stmt>;
+      auto group = [&](const std::vector<Stmt> &stmts) {
+        std::vector<SyncUnit> result;
+        for (size_t i = 0; i < stmts.size(); ++i) {
+          if (i + 1 < stmts.size() &&
+              IsMatchingEventPair(stmts[i], stmts[i + 1])) {
+            result.push_back({stmts[i], stmts[i + 1]});
+            ++i;
           } else {
-            current_syncs.push_back(stmt);
-          }
-        } else if (!IsMarkerStatement(stmt)) {
-          exec_index++;
-        }
-      }
-
-      if (!current_syncs.empty()) {
-        iter2_syncs_before_execs.push_back(current_syncs);
-      }
-
-      std::vector<std::vector<Stmt>> merged_syncs_before_execs;
-      for (size_t i = 0; i < syncs_before_execs.size(); i++) {
-        std::vector<Stmt> merged_syncs = syncs_before_execs[i];
-        if (i < iter2_syncs_before_execs.size()) {
-          for (const auto &sync : iter2_syncs_before_execs[i]) {
-            if (std::find(merged_syncs.begin(), merged_syncs.end(), sync) ==
-                merged_syncs.end()) {
-              merged_syncs.push_back(sync);
-            }
+            result.push_back({stmts[i]});
           }
         }
-        merged_syncs_before_execs.push_back(merged_syncs);
-      }
-
-      for (size_t i = 0; i < exec_stmts.size(); i++) {
-        std::vector<Stmt> syncs;
-        for (const auto &sync : merged_syncs_before_execs[i]) {
-          if (!ContainsSync(syncs, sync)) {
-            syncs.push_back(sync);
-            merged_stmts.push_back(sync);
-          }
+        return result;
+      };
+      auto left = group(first);
+      auto right = group(second);
+      auto same = [&](const SyncUnit &a, const SyncUnit &b) {
+        if (a.size() != b.size()) {
+          return false;
         }
-        merged_stmts.push_back(exec_stmts[i]);
-      }
+        // Renumbered event pairs are equivalent only as whole pairs. A lone
+        // event must keep its identity, so it cannot be matched by pipe alone.
+        return a.size() == 2 ? IsSameSyncOperation(a[0], b[0]) &&
+                                   IsSameSyncOperation(a[1], b[1])
+                             : StructuralEqual()(a[0], b[0]);
+      };
 
-      if (merged_syncs_before_execs.size() > exec_stmts.size()) {
-        for (const auto &sync : merged_syncs_before_execs[exec_stmts.size()]) {
-          merged_stmts.push_back(sync);
+      // Preserve each analysis's event order. A set union can turn [B->C,A->B]
+      // and [A->B,B->C] into just [B->C,A->B], losing the second ordering.
+      std::vector<std::vector<size_t>> common(
+          left.size() + 1, std::vector<size_t>(right.size() + 1));
+      for (size_t i = left.size(); i-- > 0;) {
+        for (size_t j = right.size(); j-- > 0;) {
+          common[i][j] = same(left[i], right[j])
+                             ? 1 + common[i + 1][j + 1]
+                             : std::max(common[i + 1][j], common[i][j + 1]);
         }
       }
-
-      return merged_stmts;
+      std::vector<Stmt> merged;
+      size_t i = 0, j = 0;
+      while (i < left.size() || j < right.size()) {
+        const SyncUnit *unit;
+        if (i < left.size() && j < right.size() && same(left[i], right[j])) {
+          unit = &left[i++];
+          ++j;
+        } else if (j == right.size() ||
+                   (i < left.size() && common[i + 1][j] >= common[i][j + 1])) {
+          unit = &left[i++];
+        } else {
+          unit = &right[j++];
+        }
+        merged.insert(merged.end(), unit->begin(), unit->end());
+      }
+      return merged;
     }
 
     bool IsMarkerStatement(const Stmt &stmt) {
@@ -665,15 +842,6 @@ private:
                      call->op.same_as(tl::ascend_auto_wait_flag())) {
             return true;
           }
-        }
-      }
-      return false;
-    }
-
-    bool ContainsSync(const std::vector<Stmt> &stmts, const Stmt &sync_stmt) {
-      for (const auto &stmt : stmts) {
-        if (IsSyncStatement(stmt) && IsSameSyncOperation(stmt, sync_stmt)) {
-          return true;
         }
       }
       return false;
@@ -785,53 +953,36 @@ private:
     public:
       StmtFlattener(std::vector<Stmt> &result) : result_(result) {}
 
-      void VisitStmt_(const SeqStmtNode *op) override {
-        for (const Stmt &stmt : op->seq) {
-          VisitStmt(stmt);
+      void VisitStmt(const Stmt &stmt) final {
+        if (const auto *seq = stmt.as<SeqStmtNode>()) {
+          for (const Stmt &child : seq->seq) {
+            VisitStmt(child);
+          }
+          return;
         }
-      }
-
-      void VisitStmt_(const IfThenElseNode *op) override {
-        result_.push_back(GetRef<Stmt>(op));
-      }
-
-      void VisitStmt_(const EvaluateNode *op) override {
-        result_.push_back(GetRef<Stmt>(op));
-      }
-
-      void VisitStmt_(const AttrStmtNode *op) override {
-        if (op->attr_key == "iteration_start" ||
-            op->attr_key == "iteration_end") {
-          result_.push_back(GetRef<Stmt>(op));
-          VisitStmt(op->body);
-        } else if (op->attr_key == "unrolled_loop") {
-          VisitStmt(op->body);
-        } else if (op->attr_key == "resource_scope") {
-          result_.push_back(GetRef<Stmt>(op));
-        } else {
-          result_.push_back(GetRef<Stmt>(op));
-          VisitStmt(op->body);
+        if (const auto *attr = stmt.as<AttrStmtNode>()) {
+          if (attr->attr_key == "iteration_start" ||
+              attr->attr_key == "iteration_end") {
+            result_.push_back(stmt);
+            VisitStmt(attr->body);
+            return;
+          }
+          if (attr->attr_key == "unrolled_loop") {
+            VisitStmt(attr->body);
+            return;
+          }
         }
-      }
-
-      void VisitStmt_(const LetStmtNode *op) override {
-        result_.push_back(GetRef<Stmt>(op));
-      }
-
-      void VisitStmt_(const ForNode *op) override {
-        result_.push_back(GetRef<Stmt>(op));
-      }
-
-      void VisitStmt_(const AllocateNode *op) override {
-        result_.push_back(GetRef<Stmt>(op));
-        VisitStmt(op->body);
-      }
-
-      void VisitStmt_(const BufferStoreNode *op) override {
-        result_.push_back(
-            Evaluate(Call(DataType::Handle(), Op::Get("tl.ascend_auto_barrier"),
-                          {StringImm("PIPE_ALL")})));
-        result_.push_back(GetRef<Stmt>(op));
+        if (stmt.as<BufferStoreNode>()) {
+          Stmt barrier = Evaluate(Call(DataType::Handle(),
+                                       Op::Get("tl.ascend_auto_barrier"),
+                                       {StringImm("PIPE_ALL")}));
+          if (result_.empty() || !StructuralEqual()(result_.back(), barrier)) {
+            result_.push_back(barrier);
+          }
+        }
+        // Compound execution statements remain intact here; their bodies are
+        // merged recursively at the matching execution position.
+        result_.push_back(stmt);
       }
 
     private:
@@ -993,6 +1144,12 @@ private:
 
   using AccessHistory =
       std::unordered_map<std::string, std::vector<BufferAccess>>;
+
+  struct LoopExitState {
+    std::string loop_id;
+    AccessHistory first_iteration_history;
+    bool first_iteration_seen;
+  };
 
   struct SyncRequirement {
     std::string sync_type;
@@ -1637,6 +1794,7 @@ private:
   // loop can retain alternative writers, bounded to one per pipe as well.
   // Physical aliases are joined by FindRelatedBuffers at each access.
   AccessHistory current_access_history_;
+  std::vector<LoopExitState> loop_exit_states_;
   Map<Var, PrimExpr> address_map_;
   Map<Var, PrimExpr> size_map_;
   std::string platform_;
