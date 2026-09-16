@@ -43,11 +43,14 @@ struct Plan {
 struct Layout {
   uint32_t workElements[2]{}, work1Offset{}, auxiliaryOffset{}, elements{};
 };
-constexpr Layout MakeLayout(uint32_t work0, uint32_t work1, uint32_t auxiliary) {
+constexpr Layout MakeLayout(uint32_t work0, uint32_t work1,
+                            uint32_t auxiliary) {
   // Each used slot owns one extra DataBlock for its runtime parity adjustment.
   const uint32_t reserved0 = work0 ? work0 + kFp32PerDataBlock : 0;
   const uint32_t reserved1 = work1 ? work1 + kFp32PerDataBlock : 0;
-  return {{work0, work1}, reserved0, reserved0 + reserved1,
+  return {{work0, work1},
+          reserved0,
+          reserved0 + reserved1,
           reserved0 + reserved1 + auxiliary};
 }
 constexpr Plan Invalid() { return {}; }
@@ -922,14 +925,14 @@ __aicore__ inline void ReduceGeneral(__ubuf__ float *dst, __ubuf__ float *src,
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(src) >> 5) & 1U;
   Context c{dst, src, nullptr, nullptr, tmp + T::layout.auxiliaryOffset};
   if constexpr (T::layout.workElements[0]) {
-    const uint32_t pad0 = ((reinterpret_cast<uintptr_t>(tmp) >> 5) & 1U) ^
-                          srcParity ^ 1U;
+    const uint32_t pad0 =
+        ((reinterpret_cast<uintptr_t>(tmp) >> 5) & 1U) ^ srcParity ^ 1U;
     c.work0 = tmp + pad0 * 8;
   }
   if constexpr (T::layout.workElements[1]) {
     __ubuf__ float *raw1 = tmp + T::layout.work1Offset;
-    const uint32_t pad1 = ((reinterpret_cast<uintptr_t>(raw1) >> 5) & 1U) ^
-                          srcParity;
+    const uint32_t pad1 =
+        ((reinterpret_cast<uintptr_t>(raw1) >> 5) & 1U) ^ srcParity;
     c.work1 = raw1 + pad1 * 8;
   }
   Run<T>(c);
