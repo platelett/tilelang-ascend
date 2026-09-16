@@ -74,6 +74,31 @@ def _sum_after_mul_kernel():
     return main
 
 
+def _vid_reduction_scratch_guard_kernel(arena_elements=144, *, explicit=True, m=4, n=8, threads=2):
+    @T.prim_func
+    def main(
+        a: T.Tensor((m, n), "float32"),  # type: ignore
+        initial: T.Tensor((64,), "float32"),  # type: ignore
+        b: T.Tensor((m,), "float32"),  # type: ignore
+        guard_out: T.Tensor((64,), "float32"),  # type: ignore
+    ):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((m, n), "float32")
+            dst = T.alloc_ub((m,), "float32")
+            arena = T.alloc_ub((arena_elements,), "float32")
+            guard = T.alloc_ub((64,), "float32")
+            T.copy(a, src)
+            T.copy(initial, guard)
+            if explicit:
+                T.reduce_max(src, dst, dim=-1, tmp=arena)
+            else:
+                T.reduce_max(src, dst, dim=-1)
+            T.copy(dst, b)
+            T.copy(guard, guard_out)
+
+    return main
+
+
 def test_fp32_row_reduce_preserves_bisheng_auto_sync():
     """Low-level compiler regression: DMA is explicit, Vector ordering is automatic."""
     config = {
@@ -93,6 +118,71 @@ def test_fp32_row_reduce_preserves_bisheng_auto_sync():
     result = compiled(host.npu())
     expected = host.square().sum(dim=1) + 1.0
     torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_fp32_row_reduce_tmp_arena_sized_for_each_vector(explicit):
+    compiled = tilelang.compile(
+        _vid_reduction_scratch_guard_kernel(explicit=explicit),
+        out_idx=[2, 3],
+        target="ascendc",
+        pass_configs=PASS_CONFIGS,
+        compile_flags=["--cce-auto-sync=off", "-O3"],
+    )
+    source = compiled.get_kernel_source()
+    assert "reduce2d_v2::Reduce2DKind::kMax, true, 2, 8, -1, 8, true" in source
+    if explicit:
+        assert "GetWithOffset<float>(72," in source
+
+    host = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    initial = torch.full((64,), 12345.0)
+    actual, guard = compiled(host.npu(), initial.npu())
+    torch.npu.synchronize()
+    torch.testing.assert_close(actual.cpu(), host.max(dim=1).values, rtol=0, atol=0)
+    torch.testing.assert_close(guard.cpu(), initial, rtol=0, atol=0)
+
+
+def _vid_workspace_stages(func):
+    mod = tvm.IRModule.from_expr(func)
+    target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
+    mod = tilelang.transform.AscendInferBufferScope()(mod)
+    before = tilelang.transform.InjectTmpBuffer(target, plan_vid_reduction=True)(mod)
+    after = tilelang.transform.AscendVidReduction()(before)
+    return before["main"], after["main"]
+
+
+def _reduce_workspace_bytes(func):
+    sizes = []
+
+    def collect(node):
+        if isinstance(node, tvm.tir.Call) and node.op.same_as(tvm.ir.Op.get("tl.ascend_reduce")):
+            ptr = node.args[3]
+            sizes.append(int(ptr.args[3]) * tvm.DataType(ptr.args[0].dtype).itemsize())
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, collect)
+    return sizes
+
+
+@pytest.mark.parametrize(
+    "m,n,threads,before_bytes,after_bytes",
+    [(4, 8, 2, 576, 288), (8, 64, 2, 1664, 832), (512, 128, 2, 36992, 18496), (4, 8, 1, 288, 288)],
+)
+def test_fp32_row_reduce_vid_workspace_compensates_for_later_split(m, n, threads, before_bytes, after_bytes):
+    before, after = _vid_workspace_stages(_vid_reduction_scratch_guard_kernel(explicit=False, m=m, n=n, threads=threads))
+    assert _reduce_workspace_bytes(before) == [before_bytes]
+    assert _reduce_workspace_bytes(after) == [after_bytes]
+
+
+def test_fp32_row_reduce_standalone_injection_does_not_assume_vid_split():
+    mod = tvm.IRModule.from_expr(_vid_reduction_scratch_guard_kernel(explicit=False))
+    target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
+    injected = tilelang.transform.InjectTmpBuffer(target)(mod)
+    assert _reduce_workspace_bytes(injected["main"]) == [288]
+
+
+def test_fp32_row_reduce_vid_rejects_arena_that_becomes_too_small():
+    with pytest.raises(tvm.error.InternalError, match="explicit tmp arena is too small"):
+        _vid_workspace_stages(_vid_reduction_scratch_guard_kernel(arena_elements=72))
 
 
 def test_fp32_row_frontend_uses_backing_shape_and_checks_dtype():
