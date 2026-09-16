@@ -241,6 +241,50 @@ def test_fp32_reduce2d_v2_runtime_smoke():
     torch.testing.assert_close(result.cpu(), expected, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.parametrize("width,clear", [(32, False), (96, True)])
+def test_fp32_sliced_max_supports_merge_and_wide_rows(width, clear):
+    """The fp32 helper supports cases rejected by the legacy narrow path."""
+
+    @T.prim_func
+    def main(
+        a: T.Tensor((16, 128), "float32"),  # type: ignore
+        out: T.Tensor((16,), "float32"),  # type: ignore
+    ):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a_ub = T.alloc_ub((16, 128), "float32")
+            out_ub = T.alloc_ub((16,), "float32")
+            with T.Scope("V"):
+                T.copy(a, a_ub)
+                T.tile.fill(out_ub, 100.0)
+                T.reduce_max(a_ub[:, :width], out_ub, dim=-1, clear=clear)
+                T.copy(out_ub, out)
+
+    for platform in ("A2", "A3"):
+        source = _source(main, "ascendc", platform=platform)
+        assert "tl::ascend::reduce_2d<float" in source
+        assert f"Reduce2DKind::kMax, {str(clear).lower()}, 16, {width}, -1, 128," in source
+
+    compiled = tilelang.compile(
+        main,
+        out_idx=[1],
+        target="ascendc",
+        platform="A3",
+        pass_configs=PASS_CONFIGS,
+        compile_flags=["--cce-auto-sync=off", "-O3"],
+    )
+    host = torch.full((16, 128), 1.0e6, dtype=torch.float32)
+    host[:, :width] = 7.0
+    if clear:
+        # The maximum must come from beyond the first 64 fp32 elements,
+        # while the old output (100) and padding (1e6) must be excluded.
+        expected = 20.0 + torch.arange(16, dtype=torch.float32)
+        host[:, width - 1] = expected
+    else:
+        # Every old output must survive because it exceeds the input maximum.
+        expected = torch.full((16,), 100.0)
+    torch.testing.assert_close(compiled(host.npu()).cpu(), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "m,n,physical_row,scratch_bytes",
     [(247, 63, 184, 8928), (1, 16384, 16384, 9312), (1, 8, 8, 32)],

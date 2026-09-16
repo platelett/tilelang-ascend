@@ -594,13 +594,13 @@ def test_buffer_loaded_normal_mask_is_sampled_once():
     assert _setter_counts(result) == (1, 1)
 
 
-@pytest.mark.parametrize(("width", "clear", "message"), [(32, False, "cannot merge"), (96, True, "fit one vector repeat")])
-def test_narrow_reduce_retains_unsupported_case_rejections(width, clear, message):
+@pytest.mark.parametrize(("width", "clear", "message"), [(32, False, "cannot merge"), (160, True, "fit one vector repeat")])
+def test_fp16_narrow_reduce_retains_unsupported_case_rejections(width, clear, message):
     @T.prim_func
-    def main(a: T.Tensor((16, 128), "float32"), out: T.Tensor((16,), "float32")):
+    def main(a: T.Tensor((16, 256), "float16"), out: T.Tensor((16,), "float16")):
         with T.Kernel(1, threads=1, is_npu=True):
-            a_ub = T.alloc_ub((16, 128), "float32")
-            out_ub = T.alloc_ub((16,), "float32")
+            a_ub = T.alloc_ub((16, 256), "float16")
+            out_ub = T.alloc_ub((16,), "float16")
             with T.Scope("V"):
                 T.copy(a, a_ub)
                 T.reduce_max(a_ub[:, :width], out_ub, dim=-1, clear=clear)
