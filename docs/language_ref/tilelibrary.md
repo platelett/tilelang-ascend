@@ -113,6 +113,9 @@ dimension dim.
   output shapes before lowering to the backend.
 - `tmp` follows the generic arena contract above. Omit it unless the required
   capacity is known for the selected target path.
+- A2/A3 AscendC static FP32 last-axis reductions additionally enforce the
+  [row-reduction layout and scratch requirements](../ascend/row_reduce.md),
+  including backend rejection of insufficient explicit capacity.
 
 T.tile.broadcast
 ----------------
