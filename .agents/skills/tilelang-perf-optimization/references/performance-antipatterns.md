@@ -325,7 +325,6 @@ for k in T.serial(loop_k):
 pass_configs = {
 	tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
 	tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-	tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 	tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
 }
 
@@ -470,13 +469,13 @@ for j in range(1, L):
 
 ## 纯 Vector 算子的 AUTO_CV_COMBINE 误分核风险
 
-**识别特征**：纯 Vector 算子（`get_kernel_source()` 只有 `IS_ASCEND_AIV`），pass_configs 中开了 `TL_ASCEND_AUTO_CV_COMBINE: True`，且 kernel 内使用了 `T.alloc_var`。
+**识别特征**：纯 Vector 算子（`get_kernel_source()` 只有 `IS_ASCEND_AIV`），使用自动 C/V 划分，且 kernel 内使用了 `T.alloc_var`。
 
 **风险**：某些 lowering 形态可能把 `alloc_var` 的定义和使用错误分到不同核，但这不是
 “纯 Vector + AUTO_CV_COMBINE + alloc_var”必然失败的全局规则；仓内也有该组合的正向
 测试。必须先检查生成代码或最小复现，确认变量确实跨核且没有正确传递。
 
-确认发生误分核后，不能只删除 `AUTO_CV_COMBINE` 并保留 outer hardware work。优先修复或报告
+确认发生误分核后，删除 `AUTO_CV_COMBINE` 配置并不会关闭自动划分。优先修复或报告
 CombineCV / verifier 共用分类器中的错误；若为了诊断或 Expert 回退而关闭 CombineCV，必须把
 全部 Vector 工作移入显式 `T.Scope("V")`：
 
@@ -494,7 +493,7 @@ with T.Scope("V"):
 
 **检查点**：
 - `get_kernel_source()` 是否只有 `IS_ASCEND_AIV`（纯 Vector）？
-- pass_configs 是否开了 `AUTO_CV_COMBINE`？
+- 是否沿用自动 C/V 划分，还是显式设为 `False`？
 - kernel 内是否使用了 `T.alloc_var`？
 - 三者同时满足 → 检查生成代码中变量定义/使用的核归属；优先修 classifier；若关闭
   `AUTO_CV_COMBINE`，同步补齐显式 V scope

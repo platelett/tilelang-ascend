@@ -226,7 +226,7 @@ notification 协议表达。
 |--------|--------|------|
 | `tl.ascend_auto_sync` | `false` | 启用 AscendSyncInsert |
 | `tl.ascend_memory_planning` | `false` | 启用自动规划策略；Pass 仍运行并发布 address/size maps |
-| `tl.ascend_auto_cv_combine` | `false` | 启用 CombineCV |
+| `tl.ascend_auto_cv_combine` | `true` | 自动划分 C/V，并保留有效的显式 scope |
 | `tl.ascend_auto_cross_core_sync` | `false` | 启用 CombineCV 中的 workspace cross-core sync insertion |
 | `tl.ascend_auto_sync_vs` | target-dependent | 启用 AscendSyncInsertVS |
 | `tl.ascend_vector_mask_reuse` | `true` | 跨 selected Vector terminal 复用兼容 mask facts；`false` 为保守 repair |

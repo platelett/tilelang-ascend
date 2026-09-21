@@ -21,7 +21,7 @@ description: TileLang Ascend Developer/Expert 模式选择与 pass_configs 配�
 | **作用域** | 编译器自动分离 Cube/Vector | 手动 `with T.Scope("C"/"V")` |
 | **同步** | 编译器自动插入 | 手写 LOCK DSL，由预处理器生成底层 flag |
 | **CV 交互** | 默认消除 workspace+vid（`threads=2` + 片上直连，见 §3.1.1） | 显式 GM `workspace` + 手动 `vid` 二分 |
-| **pass_configs** | 按 §2.2 开启相关自动 passes；无显式 scope 时 CombineCV 必开 | 全部关闭或不设 |
+| **pass_configs** | 按 §2.2 配置同步与内存规划，沿用默认 C/V 划分 | 手写 scope 可沿用默认 C/V 划分；全手动时显式关闭 |
 | **适用场景** | 大多数算子，跨平台兼容 | 极致性能优化，需要底层控制 |
 | **示例目录** | `examples/developer_mode/` | `examples/flash_attention/fa_opt/flash_attn_bhsd_expert_*.py` |
 
@@ -32,7 +32,7 @@ pass_configs，由编译器生成 resource scope 和同步；不要因为用了 
 
 ## 2. pass_configs 详解（核心）
 
-
+配置默认值与 scope 兼容规则以 [公共语言参考](../../../../docs/language_ref/primitives.md#ascend-compilation-options-and-cv-scopes) 为准。
 
 ### 2.1 四个 Ascend 专用开关
 
@@ -42,7 +42,6 @@ import tilelang
 pass_configs = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,        # ① 自动核内同步
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,   # ② 自动内存规划
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,   # ③ 自动CV分离
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,      # ④ 自动核间同步
 }
 ```
@@ -62,15 +61,11 @@ pass_configs = {
 - **关闭时**：需手动通过 `T.annotate_address` 规划内存地址
 
 
-#### ③ TL_ASCEND_AUTO_CV_COMBINE（自动 CV 分离）
+#### ③ 自动 CV 分离的选择与检查
 
-- **底层 key**：`"tl.ascend_auto_cv_combine"`，默认 False
-- **功能**：自动将 kernel 中的 Cube 操作和 Vector 操作分离到不同的执行核
-- **开启时**：无需手写 `with T.Scope("C")` / `with T.Scope("V")`，编译器根据 buffer 类型和所用原语自动识别
-- **关闭时**：必须手动用 `T.Scope` 标注每段代码的执行域
-
-> 默认选择一种 ownership 写法：自动模式由 CombineCV 生成 scope，手动模式全部显式标注。
-> CombineCV 可以保留已有的同类显式 scope，但不要无必要地混写，更不能做 C/V 冲突嵌套。
+- 使用默认配置，不生成冗余的 `TL_ASCEND_AUTO_CV_COMBINE: True`。
+- 遇到已有显式 scope 时，检查其中的操作归属；不要仅因手写 scope 就关闭 CombineCV。
+- 只有设计要求关闭自动划分时才显式设置 `False`，并检查所有硬件操作都已放入正确 scope。
 
 #### ④ TL_ASCEND_AUTO_CV_SYNC（自动核间同步）
 
@@ -87,7 +82,7 @@ pass_configs = {
 | **Developer GEMM**（完全自动） | ✅ | ✅ | ✅ | ✅ | ❌ |
 | **Developer Flash Attention**（核间流水线） | ✅ | ✅ | ✅ | ✅ | ❌ |
 | **Developer CV 融合**（Vector计算+Cube GEMM） | ✅ | ✅ | ✅ | ✅ | ❌ |
-| **Expert / 手动 ownership** | 按设计，通常 ❌ | 按设计，通常 ❌ | ❌ | 按设计，通常 ❌ | ✅，所有 resource-specific work |
+| **Expert / 手动 scope** | 按设计，通常 ❌ | 按设计，通常 ❌ | 可沿用默认；全手动时显式关闭 | 按设计，通常 ❌ | ✅，检查操作归属 |
 
 > **Developer Flash Attention / Developer CV 融合**：默认消除 workspace+vid（`threads=2` + 片上直连），写法见 §3.1.1 与 [mode-examples.md §6](references/mode-examples.md#6-cv-融合--推荐写法消除-workspace--vidthreads2)。
 
@@ -96,14 +91,12 @@ pass_configs = {
 pass_configs = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 }
 ```
 
 **Developer GEMM / Developer CV 融合**（推荐配置）：
 ```python
 pass_configs = {
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,  # 自动分离 Cube/Vector
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,        # 自动核内同步
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,  # 自动内存规划
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,     # 自动核间同步
@@ -122,19 +115,10 @@ pass_configs = {
 
 ### 2.3 C/V 输入契约
 
-所有 resource-specific Ascend hardware work 都必须有明确 owner，纯 Vector kernel 也不例外：
-
-- `TL_ASCEND_AUTO_CV_COMBINE=True`：CombineCV 用共用分类器生成 C/V scope；适合不手写
-  resource ownership 的 Developer / Hybrid kernel。
-- `TL_ASCEND_AUTO_CV_COMBINE=False`：作者必须把所有资源相关工作放入显式
-  `T.Scope("C")` 或 `T.Scope("V")`；适合 Expert / 手动 ownership。
-- outer 只保留 resource-independent 或两侧共同执行的 control。无法分类的 opaque extern 和
-  raw source 必须放在正确的显式 scope。
-- V→V / C→C 同类嵌套允许；C→V / V→C 冲突嵌套拒绝。
-
-因此，“关闭 CombineCV 但保留无 scope 的纯 Vector kernel”不是受支持的第三种模式。
-完整 compiler contract 见 `docs/ascend/compiler_managed_vector_mask.md` 的
-Resource-scope contract。
+检查生成代码时，确认 Cube/Vector 操作均位于对应 scope，纯 Vector kernel 也不例外。
+不能推导归属的外部调用和原始代码应按公共语言参考补齐显式 scope，不能通过关闭验证绕过。
+若需要诊断自动划分，参见 `docs/ascend/compiler_managed_vector_mask.md` 的
+Resource-scope contract；不要在其他 pass 中重复推导执行核。
 
 ### 2.4 Vector mask reuse 安全开关
 
@@ -157,8 +141,8 @@ pass_configs[tilelang.PassConfigKey.TL_ASCEND_VECTOR_MASK_REUSE] = False
 
 ### 3.1 转换步骤
 
-1. **开启 pass_configs**：按 §2.2 选择；CV kernel 开四项，纯 Vector Developer kernel 开
-   AUTO_SYNC、MEMORY_PLANNING、AUTO_CV_COMBINE
+1. **配置 pass_configs**：按 §2.2 选择；恢复默认 C/V 划分，开启 AUTO_SYNC、MEMORY_PLANNING，
+   有核间依赖时检查 AUTO_CV_SYNC 是否覆盖对应交互
 2. **内存分配**：`T.alloc_L1` → `T.alloc_shared`，`T.alloc_L0C` → `T.alloc_fragment`，`T.alloc_ub` → `T.alloc_shared`
 3. **删除作用域**：移除 `with T.Scope("C")` / `with T.Scope("V")`
 4. **删除同步**：移除 `T.barrier_all()`、`T.set_flag`/`T.wait_flag`、`T.set_cross_flag`/`T.wait_cross_flag`

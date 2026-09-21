@@ -100,11 +100,12 @@ selected operation away from the setter or invalidate its typed mask parameters.
 
 ## Resource-scope contract
 
-Compiler-managed Vector operations are valid only in `T.Scope("V")`. There are two supported ways
-to establish that scope:
+Compiler-managed Vector operations are valid only in `T.Scope("V")`. The
+[public scope contract](../language_ref/primitives.md#ascend-compilation-options-and-cv-scopes)
+defines automatic placement, configuration defaults, and explicit scopes:
 
-- Developer and Hybrid kernels enable `TL_ASCEND_AUTO_CV_COMBINE`; `CombineCV` classifies the
-  resource-specific operations and creates C/V scopes.
+- `CombineCV` classifies resource-specific operations and creates C/V scopes where needed.
+  Valid handwritten scopes are preserved and are compatible with automatic placement.
 - Expert kernels that disable automatic C/V separation write `T.Scope("C")` and `T.Scope("V")`
   explicitly.
 

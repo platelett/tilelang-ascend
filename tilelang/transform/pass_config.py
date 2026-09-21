@@ -45,10 +45,11 @@ class PassConfigKey(str, Enum):
     """Enable/disable TileLang AscendMemoryPlanning pass. Default: False"""
 
     TL_ASCEND_AUTO_CV_COMBINE = "tl.ascend_auto_cv_combine"
-    """Enable/disable TileLang CombineCV pass. Default: False.
+    """Enable/disable TileLang CombineCV pass. Default: True.
 
-    When disabled, resource-specific Ascend operations require an explicit
-    ``T.Scope("C")`` or ``T.Scope("V")``.
+    Infer Cube/Vector ownership for unscoped Ascend operations while respecting
+    explicit ``T.Scope("C")`` and ``T.Scope("V")`` annotations. When disabled,
+    resource-specific operations require explicit scopes.
     """
 
     TL_ASCEND_VECTOR_MASK_REUSE = "tl.ascend_vector_mask_reuse"

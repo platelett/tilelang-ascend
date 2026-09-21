@@ -1,8 +1,9 @@
 # CombineCV and Ascend resource-scope verification
 
 This reference owns the implementation design of the shared C/V resource classifier, `CombineCV`,
-and `AscendResourceScopeVerify`. For user-facing programming rules and compiler-managed Vector
-mask semantics, use `docs/ascend/compiler_managed_vector_mask.md`.
+and `AscendResourceScopeVerify`. For public scope rules and configuration defaults, use
+`docs/language_ref/primitives.md`; for Vector mask semantics, use
+`docs/ascend/compiler_managed_vector_mask.md`.
 
 ## 1. Contract
 
@@ -11,10 +12,9 @@ Ascend TIR has two execution resources:
 - C (`resource_scope=0`): Cube compute and its local L1/L0/MTE1/FIX work;
 - V (`resource_scope=1`): Vector compute and its local UB work.
 
-Developer and Hybrid kernels may omit explicit scopes only when
-`tl.ascend_auto_cv_combine=true`; `CombineCV` then creates the two branches. If automatic
-separation is disabled, every resource-specific operation must already be inside the matching
-`T.Scope("C")` or `T.Scope("V")`.
+`CombineCV` creates the required branches for operations without explicit scopes and preserves
+valid handwritten scopes. If automatic separation is explicitly disabled, every resource-specific
+operation must already be inside the matching `T.Scope("C")` or `T.Scope("V")`.
 
 The outer region is not a third hardware resource. It may contain scalar/global structure and
 operations classified as common, but not unowned local hardware work.

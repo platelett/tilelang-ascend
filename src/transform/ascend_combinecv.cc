@@ -1305,7 +1305,7 @@ public:
     arith::Analyzer analyzer;
     CombineCV substituter(&analyzer);
     bool ascend_auto_combine =
-        ctx->GetConfig<Bool>(ascendAutoCombine, Bool(false)).value();
+        ctx->GetConfig<Bool>(ascendAutoCombine, Bool(true)).value();
     if (!ascend_auto_combine) {
       return f;
     }

@@ -60,9 +60,8 @@ Covers:
 
 Strategy:
   - VS-only mode (sibling AscendSyncInsert OFF, VS ON) for isolation.
-  - CombineCV is enabled by default (TL_ASCEND_AUTO_CV_COMBINE: True) as it is
-    required for correct pipeline tracking.  A dedicated test verifies the
-    CV-combine-OFF path.
+  - CombineCV assigns Cube/Vector scopes by default. A dedicated test
+    explicitly disables it and supplies a Vector scope.
   - Differential testing: compile same kernel with VS ON vs OFF, assert delta.
   - Inspect generated source via kernel.get_kernel_source() + regex assertions.
   - Parametrized over ascendc and pto backends.
@@ -84,21 +83,18 @@ PASS_VS_ONLY = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC_VS: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 }
 
 PASS_NO_SYNC = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC_VS: False,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 }
 
 PASS_FULL = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC_VS: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 }
 
 PASS_VS_NO_CV = {
@@ -112,7 +108,6 @@ PASS_VS_NO_PLAN = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC_VS: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: False,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 }
 
 
@@ -1613,7 +1608,6 @@ def test_pto_auto_enabled_by_default():
     pass_configs = {
         tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
         tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-        tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     }
     src, _ = _compile_and_get_source(main, pass_configs, target="pto", out_idx=[1])
     _assert_has_sync(src, "pto", "barrier_v")
@@ -1850,7 +1844,6 @@ def test_ascendc_default_vs_off():
     pass_configs = {
         tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
         tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-        tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     }
     src, _ = _compile_and_get_source(main, pass_configs, target="ascendc", out_idx=[1])
     _assert_no_auto_sync(src, "ascendc")

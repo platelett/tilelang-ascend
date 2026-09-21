@@ -130,7 +130,7 @@ Read `new-pass-placement-guide.md` before inserting a pass near this tail.
 
 | Key | Default semantics | Effect |
 | --- | --- | --- |
-| `tl.ascend_auto_cv_combine` | false | Enable automatic C/V splitting; otherwise explicit scopes are required |
+| `tl.ascend_auto_cv_combine` | true | Automatic C/V splitting; preserve valid explicit scopes |
 | `tl.ascend_auto_cross_core_sync` | false | Enable CombineCV's existing automatic workspace cross-core sync |
 | `tl.ascend_memory_planning` | false strategy flag | Control automatic planning behavior; the pass still runs to publish maps |
 | `tl.ascend_auto_sync` | false | Enable AscendSyncInsert's automatic synchronization |

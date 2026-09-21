@@ -11,7 +11,6 @@ from tilelang.transform.pass_config import process_default_pass_config
 tilelang.disable_cache()
 
 PASS_CONFIGS = {
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
@@ -168,7 +167,9 @@ def test_fp32_row_reduce_tmp_arena_sized_for_each_vector(explicit):
         compile_flags=["--cce-auto-sync=off", "-O3"],
     )
     source = compiled.get_kernel_source()
-    assert "reduce2d_v2::Reduce2DKind::kMax, true, 2, 8, -1, 8, true" in source
+    # The final argument controls platform-specific instruction selection.
+    # This test checks the per-Vector scratch shape, independently of that flag.
+    assert "reduce2d_v2::Reduce2DKind::kMax, true, 2, 8, -1, 8," in source
     if explicit:
         assert "GetWithOffset<float>(72," in source
 

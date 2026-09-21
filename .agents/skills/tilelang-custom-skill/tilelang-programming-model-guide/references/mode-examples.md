@@ -386,7 +386,7 @@ def w4a8_gemm_cv(M, N, K):
 **必须开启 4 个 pass_configs**：
 - `AUTO_CV_COMBINE`：编译器自动识别 Cube/Vector 操作并分离到不同核
 - `AUTO_CV_SYNC`：编译器自动在 Cube/Vector 写入 workspace 后插入核间同步
-- **不要手写 `T.Scope("C")` / `T.Scope("V")`**（会与 AUTO_CV_COMBINE 冲突）
+- 已有手写 `T.Scope("C")` / `T.Scope("V")` 可以保留；检查其中的操作归属，不必关闭默认的 C/V 划分。
 
 ### 7.3 V 核并行化（避免算力浪费）
 

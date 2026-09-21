@@ -926,10 +926,7 @@ def test_resource_scope_is_explicit_nested_and_fail_closed():
             scoped = tir.AttrStmt(_int(0), "resource_scope", scope, statement)
             function = _with_body(_add_fp32, scoped, scoped=False)
             tilelang.transform.AscendResourceScopeVerify()(IRModule({"main": function}))
-        with (
-            tilelang.transform.PassContext(config={"tl.ascend_auto_cv_combine": True}),
-            pytest.raises(Exception, match="must be inside T.Scope"),
-        ):
+        with pytest.raises(Exception, match="must be inside T.Scope"):
             tilelang.transform.CombineCV()(IRModule({"main": _with_body(_add_fp32, statement, scoped=False)}))
 
 
@@ -967,8 +964,7 @@ def test_resource_scope_normalizes_pipe_case_but_rejects_ambiguous_sync():
 
     def combine(program):
         module = LowerAndLegalize(IRModule({"main": program}), ASCENDC)
-        with tilelang.transform.PassContext(config={"tl.ascend_auto_cv_combine": True}):
-            return tilelang.transform.CombineCV()(module)["main"]
+        return tilelang.transform.CombineCV()(module)["main"]
 
     for program in [vector_context, cube_context]:
         combined = combine(program)
@@ -1013,8 +1009,7 @@ def test_cross_resource_copy_routes(name, scopes, owner, tail):
         with pytest.raises(Exception, match="copy operand storage scope"):
             verify(program(invalid, owner))
 
-    with tilelang.transform.PassContext(config={"tl.ascend_auto_cv_combine": True}):
-        combined = tilelang.transform.CombineCV()(program(scopes))
+    combined = tilelang.transform.CombineCV()(program(scopes))
     verify(combined)
     branches = combined["main"].body.block.body.seq
     op_name = name if name.startswith("tl.ascend_") else "tir.call_extern"
