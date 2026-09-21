@@ -48,6 +48,44 @@ def _source(func, target="auto", platform="A3"):
         return tilelang.lower(func, target=target, platform=platform).kernel_source
 
 
+@pytest.mark.parametrize("m,n,pitch,scratch_elements", [(1, 8192, 12288, 4096), (104, 373, 392, 6312)])
+@pytest.mark.parametrize("clear", [True, False])
+@pytest.mark.parametrize("poison", [-3.0, 100.0])
+def test_fp32_sum_does_not_read_previous_scratch(m, n, pitch, scratch_elements, clear, poison):
+    """Cover recursive sum and the column-to-copy edge with distinguishable old data."""
+
+    @T.prim_func
+    def main(a: T.Tensor((m, pitch), "float32"), b: T.Tensor((m,), "float32")):
+        with T.Kernel(1, is_npu=True) as (_, vid):
+            src = T.alloc_ub((m, pitch), "float32")
+            dst = T.alloc_ub((m,), "float32")
+            scratch = T.alloc_ub((scratch_elements,), "float32")
+            with T.Scope("V"):
+                if vid == 0:
+                    T.copy(a, src)
+                    T.tile.fill(dst, 2.0)
+                    T.tile.fill(scratch, poison)
+                    # Drain initialization, then exercise the helper's internal waits.
+                    T.barrier_all()
+                    T.reduce_sum(src, dst, dim=-1, real_shape=[m, n], clear=clear, tmp=scratch)
+                    T.barrier_all()
+                    T.copy(dst, b)
+
+    compiled = tilelang.compile(
+        main,
+        out_idx=[1],
+        target="ascendc",
+        pass_configs=PASS_CONFIGS,
+        compile_flags=["--cce-auto-sync=off", "-O3"],
+    )
+    host = torch.full((m, pitch), 1000000.0)
+    row_values = (1 + torch.arange(m) % 7).to(torch.float32)
+    host[:, :n] = row_values[:, None]
+    expected = row_values * n + (0 if clear else 2)
+    actual = compiled(host.npu())
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 def _sum_after_mul_kernel():
     @T.prim_func
     def main(

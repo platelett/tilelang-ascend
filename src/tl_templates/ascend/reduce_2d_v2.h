@@ -501,13 +501,23 @@ __aicore__ inline void WholeReduce(__ubuf__ float *dst, __ubuf__ float *src,
 }
 template <class T, class StaticDelay>
 __aicore__ inline void WaitForVectorData(__ubuf__ float *scratch) {
-  constexpr vector_delay::Delay delay = StaticDelay::value;
+  constexpr vector_delay::Delay delay =
+      vector_delay::StaticDelay<StaticDelay::value.dependency,
+                                StaticDelay::value.naturalDistance,
+                                T::kind == Reduce2DKind::kSum>::value;
   constexpr vector_delay::WaitKind wait =
       vector_delay::ChooseWait(delay, T::allowRepeatZero);
   if constexpr (wait == vector_delay::WaitKind::RepeatZeroVcg)
     Delay<delay.repeatZeroDescriptors>(scratch);
   else if constexpr (wait == vector_delay::WaitKind::VectorBarrier)
     pipe_barrier(PIPE_V);
+}
+template <class T, uint32_t Count>
+__aicore__ inline void WaitForColumnMerge(__ubuf__ float *scratch) {
+  if constexpr (!T::allowRepeatZero)
+    pipe_barrier(PIPE_V);
+  else if constexpr (Count != 0)
+    Delay<Count>(scratch);
 }
 template <class T, uint32_t I, uint32_t SrcOffset, uint32_t DstOffset,
           uint32_t BlockStride, uint32_t RowStart = 0, uint32_t RowStride = 1,
@@ -619,17 +629,21 @@ __aicore__ inline void MergeRows(__ubuf__ float *dst, __ubuf__ float *column,
         column + offset * SrcStride, count, 1, Merge ? 1 : SrcStride, SrcStride,
         8, Merge ? 8 : 8 * SrcStride, 8 * SrcStride);
 }
-template <class T, bool Merge, uint32_t SrcStride = 1, uint32_t Start = 0>
-__aicore__ inline void MergeColumn(__ubuf__ float *dst,
-                                   __ubuf__ float *column) {
+template <class T, bool Merge, uint32_t SrcStride = 1, uint32_t Start = 0,
+          uint32_t TailWait = 0>
+__aicore__ inline void MergeColumn(__ubuf__ float *dst, __ubuf__ float *column,
+                                   __ubuf__ float *scratch = nullptr) {
   constexpr uint32_t full = T::kM / 64;
   if constexpr (Start < full) {
     constexpr uint32_t count =
         full - Start < kMaxRepeats ? full - Start : kMaxRepeats;
     SetMask<~uint64_t{0}>();
     MergeRows<T, Merge, SrcStride>(dst, column, count, Start * 64);
-    MergeColumn<T, Merge, SrcStride, Start + count>(dst, column);
+    MergeColumn<T, Merge, SrcStride, Start + count, TailWait>(dst, column,
+                                                              scratch);
   } else if constexpr (Start == full && T::kM % 64) {
+    if constexpr (TailWait != 0)
+      WaitForColumnMerge<T, TailWait>(scratch);
     SetMask<(uint64_t{1} << (T::kM % 64)) - 1>();
     MergeRows<T, Merge, SrcStride>(dst, column, 1, full * 64);
   }
@@ -703,11 +717,25 @@ template <class T, uint32_t I = 0, bool Stage = true> struct ColumnTiming {
   inline static constexpr int32_t parentCredit =
       vector_delay::ParentColumnNaturalCredit(I, Stage, count, T::kM);
   inline static constexpr vector_delay::DelayInput nonFinal =
-      vector_delay::ColumnNonFinalInput(T::kM, Stage);
+      vector_delay::ColumnNonFinalInput(T::kM, Stage,
+                                        T::kind == Reduce2DKind::kSum);
   inline static constexpr vector_delay::DelayInput final =
       vector_delay::ColumnFinalInput(T::kM, parentCredit);
   inline static constexpr vector_delay::DelayInput update =
       vector_delay::ColumnFinalInput(T::kM);
+  inline static constexpr vector_delay::ColumnMergeWait finalWait =
+      vector_delay::SplitColumnAccumulatorWait(
+          T::kM,
+          vector_delay::CalculateDelay(final.dependency, final.naturalDistance,
+                                       T::kind == Reduce2DKind::kSum),
+          T::kind == Reduce2DKind::kSum && count > 2);
+  inline static constexpr vector_delay::ColumnMergeWait updateWait =
+      vector_delay::SplitColumnAccumulatorWait(
+          T::kM,
+          vector_delay::CalculateDelay(update.dependency,
+                                       update.naturalDistance,
+                                       T::kind == Reduce2DKind::kSum),
+          T::kind == Reduce2DKind::kSum);
   using NonFinal =
       vector_delay::StaticDelay<nonFinal.dependency, nonFinal.naturalDistance>;
   using Final =
@@ -729,9 +757,10 @@ __aicore__ inline __ubuf__ float *ColumnSlot(__ubuf__ float *base) {
     return base +
            ((Column % 3) * ((2 * groups + 15) / 16 * 16) + Column % 2) * 8;
 }
-template <class T, bool Compact, uint32_t Start = 0>
+template <class T, bool Compact, uint32_t Start = 0, uint32_t TailWait = 0>
 __aicore__ inline void MergePair(__ubuf__ float *dst, __ubuf__ float *a,
-                                 __ubuf__ float *b) {
+                                 __ubuf__ float *b,
+                                 __ubuf__ float *scratch = nullptr) {
   constexpr uint32_t repeats = T::kM / 64;
   if constexpr (Start < repeats) {
     constexpr uint32_t count = repeats - Start < kMaxRepeats ? repeats - Start
@@ -740,9 +769,11 @@ __aicore__ inline void MergePair(__ubuf__ float *dst, __ubuf__ float *a,
     SetMask<~uint64_t{0}>();
     BinaryReduce<T>(dst + out * (Compact ? 1 : 2), a + in, b + in, count,
                     Compact ? 1 : 2, 2, 2, Compact ? 8 : 16, 16, 16);
-    MergePair<T, Compact, Start + count>(dst, a, b);
+    MergePair<T, Compact, Start + count, TailWait>(dst, a, b, scratch);
   }
   if constexpr (Start == repeats && T::kM % 64) {
+    if constexpr (TailWait != 0)
+      WaitForColumnMerge<T, TailWait>(scratch);
     SetMask<(uint64_t{1} << (T::kM % 64)) - 1>();
     constexpr uint32_t in = repeats * 128, out = repeats * 64;
     BinaryReduce<T>(dst + out * (Compact ? 1 : 2), a + in, b + in, 1,
@@ -780,9 +811,11 @@ EmitEvenColumns(Context &c, __ubuf__ float *src, __ubuf__ float *base,
                         ColumnSlot<T, I, Column>(base));
     EmitEvenColumns<T, I, Stage, Column + 1>(c, src, base, tail, result);
   } else {
-    WaitForVectorData<T, typename ColumnTiming<T, I, Stage>::Final>(c.aux);
-    MergePair<T, true>(result, ColumnSlot<T, I, Column - 1>(base),
-                       ColumnSlot<T, I, Column>(base));
+    using Timing = ColumnTiming<T, I, Stage>;
+    WaitForColumnMerge<T, Timing::finalWait.leading>(c.aux);
+    MergePair<T, true, 0, Timing::finalWait.tail>(
+        result, ColumnSlot<T, I, Column - 1>(base),
+        ColumnSlot<T, I, Column>(base), c.aux);
   }
 }
 template <class T, uint32_t I, bool Stage = true>
@@ -844,8 +877,9 @@ __aicore__ inline void EmitColumnsLeaf(Context &c, __ubuf__ float *src) {
       }
     }
     if constexpr (s.merge) {
-      WaitForVectorData<T, typename ColumnTiming<T, I, Stage>::Update>(c.aux);
-      MergeColumn<T, true>(c.dst, result);
+      using Timing = ColumnTiming<T, I, Stage>;
+      WaitForColumnMerge<T, Timing::updateWait.leading>(c.aux);
+      MergeColumn<T, true, 1, 0, Timing::updateWait.tail>(c.dst, result, c.aux);
     }
   }
 }
