@@ -621,11 +621,11 @@ AscendResource ResourceForStorageScope(const std::string &scope) {
 }
 
 AscendResource ResourceForBufferStore(const BufferStoreNode *store) {
-  // GM scalar stores keep the established Cube ownership. Per-core scalar
-  // state has no fixed owner: outer local/local.var assignments are shared
-  // computations and must accompany the control flow on both generated sides.
+  // A GM address does not identify which core should write it. Require an
+  // explicit owner rather than duplicating the side effect or choosing Cube.
+  // Per-core scalar assignments remain shared with their control flow.
   if (store->buffer.scope() == "global") {
-    return AscendResource::kCube;
+    return AscendResource::kExplicit;
   }
   return ResourceForStorageScope(store->buffer.scope());
 }
@@ -893,7 +893,11 @@ bool IsContextDependentResourceCall(const CallNode *call) {
       return false;
     }
     const auto *pipe = call->args[0].as<StringImmNode>();
-    return pipe != nullptr && NormalizePipeName(pipe->value) == "ALL";
+    if (pipe == nullptr) {
+      return false;
+    }
+    std::string normalized = NormalizePipeName(pipe->value);
+    return normalized == "ALL" || normalized == "MTE2" || normalized == "MTE3";
   }
   if (!call->op.same_as(ascend_set_flag()) &&
       !call->op.same_as(ascend_wait_flag())) {
@@ -1210,7 +1214,10 @@ private:
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    AscendResource resource = ResourceForStorageScope(op->buffer.scope());
+    ICHECK(op->buffer.scope() != "global" || scope_ >= 0)
+        << "GM scalar stores must be inside an explicit T.Scope(\"C\") or "
+           "T.Scope(\"V\"); CombineCV cannot infer the writer.";
+    AscendResource resource = ResourceForBufferStore(op);
     Check(resource, "BufferStore to " + op->buffer.scope());
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -1285,6 +1292,8 @@ public:
       return StmtMutator::VisitStmt_(op);
     }
     AscendResource resource = ResourceForBufferStore(op);
+    ICHECK(resource != AscendResource::kExplicit)
+        << "Unscoped GM scalar store reached CombineCV emission";
     if (resource == AscendResource::kNone) {
       return StmtMutator::VisitStmt_(op);
     }

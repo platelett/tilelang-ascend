@@ -15,7 +15,8 @@ description: TileLang-Ascend 新增 Ascend 专属 T.tile.xxx 小 API 的端到�
 
 1. 阅读 `AGENTS.md`。
 2. 阅读 `.agents/skills/tilelang-custom-skill/tilelang-api-best-practices/SKILL.md`。
-3. 阅读 `.agents/skills/tilelang-custom-skill/tilelang-api-best-practices/references/api-compute.md`。
+3. 按 API 索引查对应公共文档，只读本次操作相关部分；静态 FP32 行归约从
+   [语言参考](../../../docs/language_ref/tilelibrary.md#static-fp32-row-reductions) 入手。
 4. 如果涉及编程模式或 `pass_configs`，阅读 `.agents/skills/tilelang-custom-skill/tilelang-programming-model-guide/SKILL.md`。
 5. 查看 `tilelang/language/ascend_tile.py` 中最相近的现有 API。
 6. 查看 `testing/python/language/` 中最相近的测试。
@@ -119,7 +120,8 @@ mask 行为。按三类区分：
 2. 精确的 source ABI、dtype/operand 关系和 payload validation；
 3. 所有 runtime path 的 mode、low word、high word `requires` / `ensures` 审计；
 4. selected terminal 的 Codegen emitter；
-5. auto CombineCV、正确显式 V scope、wrong/unscoped rejection 的 scope 测试。
+5. 默认不写 scope 成功、保留正确手写 scope、错误 scope 拒绝；缺 scope 的负例须显式关闭
+   CombineCV 或直接测试最终 verifier，未知外部调用则仍需显式 scope。
 6. default reuse 与 `TL_ASCEND_VECTOR_MASK_REUSE=False` 下相同 selected terminal 的保守 repair。
 
 默认不要添加 PTO 支持。只有当任务明确要求，或已有 PTO 路径能以很小、低风险的改动接入时，才考虑补充。
@@ -167,15 +169,18 @@ PASS_CONFIGS = {
 
 ## 文档更新
 
-对于面向用户的 API，更新未来用户和 agent 真正会看的文档：
+按读者需要更新对应入口，不要求每次同时扩写所有文档：
 
-- `docs/language_ref/tilelibrary.md`：简短语言参考。
-- `docs/TileLang-Ascend Programming Guide.md`：详细使用指南。
-- `.agents/skills/tilelang-custom-skill/tilelang-api-best-practices/references/api-compute.md`：agent 面向的 API 用法说明。
-- `.agents/skills/tilelang-custom-skill/tilelang-programming-model-guide/SKILL.md`：仅当编程模式建议发生变化时更新。
-- `docs/ascend/compiler_managed_vector_mask.md`：仅当 managed Vector 的公开编译契约发生变化时更新；
-  不要把完整 Selection 表或 helper contract 复制进本 skill。
-- 不要为了内部 helper 去更新宽泛文档。
+| 位置 | 负责内容 | 更新时机 |
+| --- | --- | --- |
+| `docs/language_ref/` | 唯一的公开签名、默认值、合法输入和错误边界 | 公开行为变化 |
+| Programming Guide、`docs/api_docs/` | 概念、使用流程和操作示例，链接共同约束 | 用户写法变化 |
+| `docs/ascend/` | 编译器设计与维护约束 | pass、指令选择或 helper 的设计变化 |
+| skills | agent 的路由、实现决策和检查点，链接上述依据 | agent 需要改变做法 |
+| `examples/` | 可执行的完整用法 | 需要新增或调整代表性用例 |
+
+不要把 dtype/布局/临时空间表或整段示例复制进 skill。内部 helper 变化若不改变公开行为，
+只更新对应设计说明与维护检查点。
 
 如果旧文档里有相似但语义不同的全局 API，增加简短提醒，而不是静默改写可能属于 GPU / 主仓教程的示例。
 

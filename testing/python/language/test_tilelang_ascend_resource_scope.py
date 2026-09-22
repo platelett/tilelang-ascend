@@ -106,6 +106,66 @@ def test_default_combine_preserves_explicit_owners_and_rejects_conflicts():
         _combine(_module(_scope(0, vector_fill), ub))
 
 
+def test_unscoped_gm_scalar_store_is_not_inferred_from_context():
+    gm = tir.decl_buffer((64,), "float32", name="gm", scope="global")
+    l1 = tir.decl_buffer((64,), "float32", name="l1", scope="shared.l1")
+    ub = tir.decl_buffer((64,), "float32", name="ub", scope="shared.ub")
+    store = tir.BufferStore(gm, tir.FloatImm("float32", 1), [0])
+    cube = tir.BufferStore(l1, tir.FloatImm("float32", 2), [0])
+    vector = tir.Evaluate(T.tile.fill(ub, 2.0))
+
+    for body in [store, tir.SeqStmt([cube, store, cube]), tir.SeqStmt([vector, store, vector])]:
+        with pytest.raises(Exception, match="GM scalar store"):
+            _combine(_module(body, gm, l1, ub))
+    with pytest.raises(Exception, match="GM scalar store"):
+        tilelang.transform.AscendResourceScopeVerify()(_module(store, gm))
+
+
+def test_shared_gm_scalar_read_and_local_assignments_are_preserved():
+    gm = tir.decl_buffer((1,), "float32", name="gm", scope="global")
+    state = tir.decl_buffer((1,), "float32", name="state", scope="local.var")
+    value = tir.Var("value", "float32")
+    shared = tir.LetStmt(
+        value,
+        gm[0],
+        tir.SeqStmt(
+            [
+                tir.BufferStore(state, value, [0]),
+                tir.BufferStore(state, state[0] + 1, [0]),
+            ]
+        ),
+    )
+    for branch in _combine(_module(shared, gm, state)):
+        ir.assert_structural_equal(branch.body, shared)
+
+
+@pytest.mark.parametrize("pipe", ["ALL", "MTE2", "MTE3"])
+def test_shared_pipe_barrier_uses_context_or_explicit_owner(pipe):
+    l1 = tir.decl_buffer((64,), "float32", name="l1", scope="shared.l1")
+    ub = tir.decl_buffer((64,), "float32", name="ub", scope="shared.ub")
+    operations = [
+        tir.BufferStore(l1, tir.FloatImm("float32", 1), [0]),
+        tir.Evaluate(T.tile.fill(ub, 1.0)),
+    ]
+    barrier = tir.Evaluate(T.pipe_barrier(pipe))
+    for owner, operation in enumerate(operations):
+        branches = _combine(_module(tir.SeqStmt([operation, barrier, operation]), l1, ub))
+        assert not _calls(branches[1 - owner], "tl.ascend_pipe_barrier")
+        calls = _calls(branches[owner], "tl.ascend_pipe_barrier")
+        assert len(calls) == 1
+        ir.assert_structural_equal(calls[0], barrier.value)
+
+    # An explicit V barrier stays on V even when the surrounding work is C.
+    explicit = tir.SeqStmt([operations[0], _scope(1, barrier), operations[0]])
+    branches = _combine(_module(explicit, l1, ub))
+    assert not _calls(branches[0], "tl.ascend_pipe_barrier")
+    assert len(_calls(branches[1], "tl.ascend_pipe_barrier")) == 1
+
+    for body in [barrier, tir.SeqStmt([operations[0], barrier, operations[1]])]:
+        with pytest.raises(Exception, match="must be inside T.Scope"):
+            _combine(_module(body, l1, ub))
+
+
 @pytest.mark.parametrize(
     "producer,sync_key,expected",
     [
@@ -172,10 +232,10 @@ def test_dcci_explicit_owners_and_ub_restriction():
         tilelang.transform.AscendResourceScopeVerify()(_module(_scope(0, _dcci(ub)), ub))
 
 
-def test_dcci_uses_context_including_scalar_store_ownership():
+def test_dcci_uses_context_from_owned_operations():
     gm = tir.decl_buffer((64,), "float32", name="gm", scope="global")
     ub = tir.decl_buffer((64,), "float32", name="ub", scope="shared.ub")
-    cube = tir.BufferStore(gm, tir.FloatImm("float32", 1), [0])
+    cube = _scope(0, tir.BufferStore(gm, tir.FloatImm("float32", 1), [0]))
     vector = tir.Evaluate(T.tile.fill(ub, 0.0))
     dcci = _dcci(gm)
 
@@ -220,7 +280,7 @@ def test_shared_loop_control_retains_scalar_dependencies_on_both_sides(loop_kind
     body = tir.SeqStmt(
         [
             _scope(1, tir.Evaluate(T.tile.fill(ub, 1.0))),
-            tir.BufferStore(gm, tir.Cast("float32", state[0]), [0]),
+            _scope(0, tir.BufferStore(gm, tir.Cast("float32", state[0]), [0])),
             tir.BufferStore(state, state[0] + 1, [0]),
             tir.IfThenElse(state[0] >= limit, tir.Evaluate(T.loop_break()), None),
         ]

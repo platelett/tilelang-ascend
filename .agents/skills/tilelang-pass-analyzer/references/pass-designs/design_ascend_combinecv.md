@@ -51,8 +51,8 @@ Operation names and buffer scopes are not interchangeable:
 
 - an Add or MMA has an intrinsic execution resource;
 - a generic copy is resolved from its concrete src/dst path;
-- MTE2, MTE3, S, and ALL are not sufficient by themselves to choose C or V, so local operands or
-  an explicit scope must disambiguate them.
+- MTE2, MTE3, S, and ALL alone cannot choose C or V; use local operands, the recognized
+  context-dependent forms below, or an explicit scope.
 
 ### 2.2 Storage-scope mapping
 
@@ -75,7 +75,8 @@ last-writer-wins classification.
 - Vector-mask setters, selected managed Vector terminals, and set-deq-scale are Vector.
 - `set_flag` / `wait_flag` use their directed pipe pair.
 - pipe barriers, cross flags, and auto barriers use their pipe argument.
-- `barrier_all`, local MTE2/MTE3 events without a unique owner, and GM DCCI use context.
+- `barrier_all`, ALL/MTE2/MTE3 pipe barriers, local MTE2/MTE3 events without a unique owner,
+  and GM DCCI use context.
   With CombineCV, require a pure C/V region or equal nearest owners on both sides;
   shared GM scalar reads prevent automatic GM DCCI ownership.
 - A normalized `call_extern` name is looked up in `GetOperationConfig()`; access pointers then
@@ -117,9 +118,9 @@ input tilelang_root
 Common operations are intentionally retained in both branches. Explicit C/V scope bodies enter
 only their matching emitter and are not reclassified statement by statement.
 
-Unscoped GM scalar stores retain the historical Cube owner. Shared local/local.var assignments
-are retained in both branches; UB/L1/L0 stores follow their local storage owner. Explicit stores
-retain their declared scope. The late verifier checks loads and stores, including expressions.
+Reject unscoped GM scalar stores before splitting; do not add them to context inference.
+Shared local/local.var assignments remain in both branches; UB/L1/L0 stores follow their local
+storage owner. Explicit stores retain their declared scope. The late verifier also checks stores.
 
 ## 4. AscendResourceScopeVerify
 
@@ -132,7 +133,7 @@ Rules:
 1. Cube operations and local L1/L0 accesses require C scope.
 2. Vector operations, UB accesses, vectorized loops, selected terminals, and mask setters require
    V scope.
-3. `kExplicit` operations require some explicit C/V scope; the author chooses the owner.
+3. `kExplicit` operations and GM scalar stores require explicit C/V ownership.
 4. `kCommon` and `kNone` are legal in outer.
 5. C->C and V->V nesting are legal.
 6. C->V and V->C nesting are rejected because the nested generated guards can never execute.
@@ -169,8 +170,9 @@ For a new hardware operation:
 3. Add or update `OperationConfig` when that is the existing semantic source of truth.
 4. Make `MergeResources` detect inconsistent local operands.
 5. Keep unknown forms explicit-only.
-6. Add tests for auto separation, correct explicit scope, wrong scope, unscoped rejection, and
-   nested-scope behavior.
+6. Test default inference without handwritten scopes, preservation of correct explicit scopes,
+   wrong scopes, and nesting. Test missing-scope rejection with CombineCV explicitly disabled or
+   by calling the final verifier directly; opaque calls still require an explicit scope by default.
 
 If the operation is compiler-managed Vector work, also update the mask catalog and its
 Selection/Legalize tests; do not duplicate mask-effect rules here.
@@ -184,7 +186,8 @@ Permanent tests should protect behavior, not private class names:
 - one operation whose semantic resource conflicts with a local operand;
 - one pipe/event classification in each relevant resource;
 - unknown outer extern rejected, same extern accepted in an explicit scope;
-- local BufferLoad and BufferStore rejected in the wrong or outer scope;
+- local BufferLoad and BufferStore rejected in the wrong or outer scope in the final verifier's
+  input, after automatic placement when enabled;
 - common control retained in both CombineCV branches;
 - same-kind nesting accepted and conflicting nesting rejected;
 - `CombineCV` output accepted by the late verifier;

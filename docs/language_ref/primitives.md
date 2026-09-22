@@ -27,6 +27,16 @@ Every operation tied to Cube or Vector must then be inside its matching scope.
 Operations whose unit cannot be inferred, including opaque external calls and raw
 source code, require an explicit scope even with automatic placement enabled.
 
+GM scalar assignments such as `Output[i] = value` also require an explicit
+`T.Scope("C")` or `T.Scope("V")`. Choose the side that owns the assignment's
+state and indices; the compiler neither infers this owner from surrounding work
+nor defaults the write to Cube.
+
+`T.barrier_all()` and `T.pipe_barrier` with `"ALL"`, `"MTE2"`, or `"MTE3"` can
+use automatic placement when the surrounding region's other resource-specific
+work belongs to one side, or the nearest concrete operations on both sides have
+the same owner. Otherwise, supply an explicit scope for the barrier.
+
 Automatic scope placement does not enable the other three options. In particular,
 placing a producer and consumer on the correct units does not synchronize them;
 their data dependencies still need automatic or explicit synchronization.

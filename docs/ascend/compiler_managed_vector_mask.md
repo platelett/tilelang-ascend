@@ -100,7 +100,8 @@ selected operation away from the setter or invalidate its typed mask parameters.
 
 ## Resource-scope contract
 
-Compiler-managed Vector operations are valid only in `T.Scope("V")`. The
+Before mask lowering, Vector operations must belong to a V region in the IR,
+assigned automatically or through a handwritten scope. The
 [public scope contract](../language_ref/primitives.md#ascend-compilation-options-and-cv-scopes)
 defines automatic placement, configuration defaults, and explicit scopes:
 
@@ -112,7 +113,7 @@ defines automatic placement, configuration defaults, and explicit scopes:
 Resource-specific work may not remain in the outer mixed region. The late
 `AscendResourceScopeVerify` pass checks the final hardware calls after automatic synchronization
 has run. It accepts same-kind nested scopes, rejects C-inside-V or V-inside-C nesting, and rejects
-an unscoped opaque hardware call whose resource cannot be classified.
+unscoped GM scalar stores or opaque hardware calls.
 
 `CombineCV` and the verifier share one classifier. Known operations can be classified from their
 operation contract; copies are resolved from the concrete source/destination memory scopes; pipe
@@ -123,18 +124,21 @@ of inheriting the classification of an adjacent operation. An opaque call inside
 invalidates known mask facts.
 
 Known context-dependent synchronization and GM cache maintenance may use surrounding statements
-as evidence. For `barrier_all`, a local event whose MTE2/MTE3 pipes do not identify one owner, or
-GM `datacachecleanandinvalid_experiment`, `CombineCV`
+as evidence. For `barrier_all`, `pipe_barrier` on ALL/MTE2/MTE3, a local event without a unique
+MTE2/MTE3 owner, or GM `datacachecleanandinvalid_experiment`, `CombineCV`
 recursively summarizes the resource-specific work in each sequence, branch, loop, and block. It
 assigns the synchronization to C or V only when the containing region is otherwise pure, or when
 the nearest concrete statements on both sides have the same exact owner. A C/V boundary, mixed or
 opaque region, missing two-sided evidence, or disabled `TL_ASCEND_AUTO_CV_COMBINE` remains an
 error and requires an explicit scope.
+GM scalar stores never use this context inference; their owner must be explicit before splitting.
 
 The outer region is reserved for resource-independent or genuinely shared control such as
 `printf`, `sync_all`, `use_swizzle`, and global-memory dumps. It is not a third execution resource.
-Every outermost V scope starts mask analysis from unknown state, so its first selected terminal
-repairs every field it needs; facts are never reused across sibling V scopes.
+Every outermost V region in the IR starts mask analysis from unknown state, so its first selected
+operation establishes every field it needs. Facts do not cross separate outermost V regions;
+nested V blocks share the enclosing analysis, including adjacent handwritten blocks placed
+inside one V region by `CombineCV`.
 
 ## Instruction selection
 
