@@ -501,9 +501,8 @@ jobs:
         id: check_skip_pytest
         if: github.event_name == 'pull_request'
         run: |
-          BASE_REF="${{ github.base_ref }}"
-          git fetch origin $BASE_REF
-          changed_files=$(git diff --name-only origin/$BASE_REF HEAD)
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          changed_files=$(git diff --name-only "$BASE_SHA" HEAD)
           
           skip_pytest=true
           
