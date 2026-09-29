@@ -55,15 +55,20 @@ def select_kernel_mod1(M, N, block_M, block_N, dtype="float16"):
             offset_n = by * block_N
             offset_mask_n = offset_n // 8
 
-            # 1. Copy data from GM to UB
-            T.copy(A[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N], a_ub)
-            T.copy(Mask[offset_m : offset_m + sub_block_m, offset_mask_n : offset_mask_n + block_mask_width], mask_ub)
+            with T.Scope("V"):
+                # 1. Copy data from GM to UB
+                T.copy(A[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N], a_ub)
+                T.copy(Mask[offset_m : offset_m + sub_block_m, offset_mask_n : offset_mask_n + block_mask_width], mask_ub)
 
-            # 2. Execute Select instruction: select src0(A) or scalar src1 based on bits
-            T.tile.select(c_ub, mask_ub, a_ub, 1.0, "VSEL_TENSOR_SCALAR_MODE")
+                T.barrier_all()
 
-            # 3. Copy results back to GM
-            T.copy(c_ub, C[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N])
+                # 2. Execute Select instruction: select src0(A) or scalar src1 based on bits
+                T.tile.select(c_ub, mask_ub, a_ub, 1.0, "VSEL_TENSOR_SCALAR_MODE")
+
+                T.barrier_all()
+
+                # 3. Copy results back to GM
+                T.copy(c_ub, C[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N])
 
     return main
 
@@ -96,16 +101,21 @@ def select_kernel_mod2(M, N, block_M, block_N, dtype="float16"):
             offset_n = by * block_N
             offset_mask_n = offset_n // 8
 
-            # 1. Copy data from GM to UB
-            T.copy(A[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N], a_ub)
-            T.copy(B[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N], b_ub)
-            T.copy(Mask[offset_m : offset_m + sub_block_m, offset_mask_n : offset_mask_n + block_mask_width], mask_ub)
+            with T.Scope("V"):
+                # 1. Copy data from GM to UB
+                T.copy(A[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N], a_ub)
+                T.copy(B[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N], b_ub)
+                T.copy(Mask[offset_m : offset_m + sub_block_m, offset_mask_n : offset_mask_n + block_mask_width], mask_ub)
 
-            # 2. Execute Select instruction: select src0(A) or src1(B) based on bits
-            T.tile.select(c_ub, mask_ub, a_ub, b_ub, "VSEL_TENSOR_TENSOR_MODE")
+                T.barrier_all()
 
-            # 3. Copy results back to GM
-            T.copy(c_ub, C[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N])
+                # 2. Execute Select instruction: select src0(A) or src1(B) based on bits
+                T.tile.select(c_ub, mask_ub, a_ub, b_ub, "VSEL_TENSOR_TENSOR_MODE")
+
+                T.barrier_all()
+
+                # 3. Copy results back to GM
+                T.copy(c_ub, C[offset_m : offset_m + sub_block_m, offset_n : offset_n + block_N])
 
     return main
 
@@ -127,12 +137,17 @@ def select_kernel_1d_scalar(N, dtype="float16"):
             c_ub = T.alloc_ub((N,), dtype)
             mask_ub = T.alloc_ub((mask_width,), "uint8")
 
-            T.copy(A, a_ub)
-            T.copy(Mask, mask_ub)
+            with T.Scope("V"):
+                T.copy(A, a_ub)
+                T.copy(Mask, mask_ub)
 
-            T.tile.select(c_ub, mask_ub, a_ub, 1.0, "VSEL_TENSOR_SCALAR_MODE")
+                T.barrier_all()
 
-            T.copy(c_ub, C)
+                T.tile.select(c_ub, mask_ub, a_ub, 1.0, "VSEL_TENSOR_SCALAR_MODE")
+
+                T.barrier_all()
+
+                T.copy(c_ub, C)
 
     return main
 
@@ -153,13 +168,18 @@ def select_kernel_1d_tensor(N, dtype="float16"):
             c_ub = T.alloc_ub((N,), dtype)
             mask_ub = T.alloc_ub((mask_width,), "uint8")
 
-            T.copy(A, a_ub)
-            T.copy(B, b_ub)
-            T.copy(Mask, mask_ub)
+            with T.Scope("V"):
+                T.copy(A, a_ub)
+                T.copy(B, b_ub)
+                T.copy(Mask, mask_ub)
 
-            T.tile.select(c_ub, mask_ub, a_ub, b_ub, "VSEL_TENSOR_TENSOR_MODE")
+                T.barrier_all()
 
-            T.copy(c_ub, C)
+                T.tile.select(c_ub, mask_ub, a_ub, b_ub, "VSEL_TENSOR_TENSOR_MODE")
+
+                T.barrier_all()
+
+                T.copy(c_ub, C)
 
     return main
 
@@ -182,13 +202,18 @@ def select_kernel_mod3(N, dtype="float16"):
             c_ub = T.alloc_ub((N,), dtype)
             cmp_ub = T.alloc_ub((mask_width,), "uint8")
 
-            T.copy(A, a_ub)
-            T.copy(B, b_ub)
+            with T.Scope("V"):
+                T.copy(A, a_ub)
+                T.copy(B, b_ub)
 
-            T.tile.compare(cmp_ub, a_ub, b_ub, "GT")
-            T.tile.select(c_ub, cmp_ub, a_ub, b_ub, "VSEL_CMPMASK_SPR")
+                T.barrier_all()
 
-            T.copy(c_ub, C)
+                T.tile.compare(cmp_ub, a_ub, b_ub, "GT")
+                T.tile.select(c_ub, cmp_ub, a_ub, b_ub, "VSEL_CMPMASK_SPR")
+
+                T.barrier_all()
+
+                T.copy(c_ub, C)
 
     return main
 

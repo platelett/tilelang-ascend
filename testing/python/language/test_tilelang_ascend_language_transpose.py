@@ -279,16 +279,25 @@ def test_transpose_non_aligned_raises(shape, dtype):
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
 @pytest.mark.parametrize("target", ["ascendc"])
 @pytest.mark.parametrize("shape", [(16, 16), (32, 32)])
-def test_transpose_inplace_rejected(dtype, target, shape):
+def test_transpose_inplace_rejected(dtype, target, shape, capfd):
     M, _ = shape
     tilelang.cache.clear_cache()
-    with pytest.raises(ValueError, match="does not support in-place"):
+
+    # Flush any output emitted before the in-place rejection is triggered.
+    capfd.readouterr()
+
+    with pytest.raises(tilelang.tvm.error.DiagnosticError):
         tilelang.compile(
             transpose_inplace_kernel(M, dtype),
             out_idx=[-1],
             pass_configs=PASS_CONFIGS,
             target=target,
         )
+
+    # TVM's DiagnosticError only carries a generic message; the concrete
+    # diagnostic is rendered to stderr by the C++ renderer.
+    captured = capfd.readouterr()
+    assert "does not support in-place" in captured.err
 
 
 # -----------------------------------------------------------------------------
