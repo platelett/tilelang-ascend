@@ -560,8 +560,11 @@ def AscendLowerOpaqueBlock():
     return _ffi_api.AscendLowerOpaqueBlock()  # type: ignore
 
 
-def InjectTmpBuffer(target: Target):
+def InjectTmpBuffer(target: Target, plan_vid_reduction: bool = False):
     """InjectTmpBuffer for Ascend
+
+    Set plan_vid_reduction when AscendVidReduction will run afterwards.
+    Buffer scopes must already be inferred in that case.
 
     Returns
     -------
@@ -569,4 +572,4 @@ def InjectTmpBuffer(target: Target):
         The result pass
     ----
     """
-    return _ffi_api.InjectTmpBuffer(target)  # type: ignore
+    return _ffi_api.InjectTmpBuffer(target, plan_vid_reduction)  # type: ignore
