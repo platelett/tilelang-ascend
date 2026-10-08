@@ -23,31 +23,31 @@ tilelang.disable_cache()
 # ===========================================================================
 # Constants
 # ===========================================================================
-NUM_CORES = 24          # 910B AI Cores
+NUM_CORES = 24  # 910B AI Cores
 ROW_EXPAND_VECTOR_ELEMS = 64
-DIM = 128               # head dimension (fixed)
+DIM = 128  # head dimension (fixed)
 
-TILE_Q_L2 = 256         # query tile cached in L2
-TILE_KV_L1 = 1024       # key/value tile staged in L1
-TILE_KV_L2 = 1024       # key/value tile at L2 granularity
+TILE_Q_L2 = 256  # query tile cached in L2
+TILE_KV_L1 = 1024  # key/value tile staged in L1
+TILE_KV_L2 = 1024  # key/value tile at L2 granularity
 
-TILE_M = 128            # L0 tile on M (query) axis
-TILE_K = 128            # L0 tile on contraction / output-split axis
+TILE_M = 128  # L0 tile on M (query) axis
+TILE_K = 128  # L0 tile on contraction / output-split axis
 
-TILE_Q_UB = 8           # narrow strip for softmax (transcendentals)
-TILE_Q_ACC = 64         # wide strip for O_acc update (MACs)
+TILE_Q_UB = 8  # narrow strip for softmax (transcendentals)
+TILE_Q_ACC = 64  # wide strip for O_acc update (MACs)
 
-NUM_STAGES = 3          # pipeline depth / token-ring size
-NUM_L1_CHUNKS = TILE_KV_L2 // TILE_KV_L1   # currently 1
+NUM_STAGES = 3  # pipeline depth / token-ring size
+NUM_L1_CHUNKS = TILE_KV_L2 // TILE_KV_L1  # currently 1
 
 # L0 iteration counts (derived, used in GEMM macros)
-M_ITERS = TILE_Q_L2 // TILE_M    # 2  — m-tiles per GEMM invocation
-N_ITERS = TILE_KV_L1 // TILE_K   # 8  — output-split tiles (GEMM1)
-K_ITERS = TILE_KV_L1 // TILE_K   # 8  — contraction tiles  (GEMM2)
+M_ITERS = TILE_Q_L2 // TILE_M  # 2  — m-tiles per GEMM invocation
+N_ITERS = TILE_KV_L1 // TILE_K  # 8  — output-split tiles (GEMM1)
+K_ITERS = TILE_KV_L1 // TILE_K  # 8  — contraction tiles  (GEMM2)
 
 # Cross-core semaphore IDs
-SEM_CUBE = 0    # Vector → Cube: "P ready" / "slot free"
-SEM_VEC  = 1    # Cube → Vector: "S ready" / "O ready"
+SEM_CUBE = 0  # Vector → Cube: "P ready" / "slot free"
+SEM_VEC = 1  # Cube → Vector: "S ready" / "O ready"
 
 # composed softmax block alignment: float32 → 8 elements per 32-byte block
 ELEM_PER_BLK = 8
@@ -66,15 +66,26 @@ pass_configs = {
 # Layer 2: Building-block macros
 # ===========================================================================
 
+
 # ---------------------------------------------------------------------------
 # gemm_output_split: Q[TILE_Q_L2, DIM] @ K[TILE_KV_L1, DIM]^T → S[TILE_Q_L2, TILE_KV_L1]
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
 def gemm_output_split(
-    a_src, a_i0, a_offset,
-    b_src, b_i0, b_offset,
-    out, out_i0, out_i1,
-    a_l1, kv_l1, l0a, l0b, l0c,
+    a_src,
+    a_i0,
+    a_offset,
+    b_src,
+    b_i0,
+    b_offset,
+    out,
+    out_i0,
+    out_i1,
+    a_l1,
+    kv_l1,
+    l0a,
+    l0b,
+    l0c,
 ):
     # Phase 1: bulk-load all K tiles to L1
     T.wait_flag("MTE1", "MTE2", 2)
@@ -110,15 +121,26 @@ def gemm_output_split(
         T.set_flag("MTE1", "MTE2", 0 + mi_side)
     T.set_flag("MTE1", "MTE2", 2)
 
+
 # ---------------------------------------------------------------------------
 # gemm_contraction_split: P[TILE_Q_L2, TILE_KV_L1] @ V[TILE_KV_L1, DIM] → O[TILE_Q_L2, DIM]
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
 def gemm_contraction_split(
-    a_src, a_i0, a_i1,
-    b_src, b_i0, b_offset,
-    out, out_i0, out_i1,
-    a_l1, kv_l1, l0a, l0b, l0c,
+    a_src,
+    a_i0,
+    a_i1,
+    b_src,
+    b_i0,
+    b_offset,
+    out,
+    out_i0,
+    out_i1,
+    a_l1,
+    kv_l1,
+    l0a,
+    l0b,
+    l0c,
 ):
     # Phase 1: load all V tiles to L1
     T.wait_flag("MTE1", "MTE2", 2)
@@ -152,13 +174,16 @@ def gemm_contraction_split(
         T.copy(l0c[c_side, :, :], out[out_i0, out_i1, mi * TILE_M : (mi + 1) * TILE_M, :])
         T.set_flag("FIX", "M", 5 + c_side)
     T.set_flag("MTE1", "MTE2", 2)
+
+
 # ===========================================================================
 # Layer 3: Task macros (Vector scope)
 # ===========================================================================
 
 HALF_Q = TILE_Q_L2 // 2
-SOFTMAX_STRIPS = HALF_Q // TILE_Q_UB       # 16
-O_ACC_STRIPS   = HALF_Q // TILE_Q_ACC      # 2
+SOFTMAX_STRIPS = HALF_Q // TILE_Q_UB  # 16
+O_ACC_STRIPS = HALF_Q // TILE_Q_ACC  # 2
+
 
 # ---------------------------------------------------------------------------
 # vec_softmax: TASK 2 — S → P + stats + early release
@@ -176,12 +201,17 @@ def softmax_composed_update(r):
     T.reduce_max(
         score_local,
         m_stats[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
-        dim=-1, clear=False, tmp=sfm_tmp,
+        dim=-1,
+        clear=False,
+        tmp=sfm_tmp,
     )
     T.pipe_barrier("v")
     T.tile.brcb_experiment(
-        sfm_brcb, m_stats[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
-        TILE_Q_UB // 8, 1, 8,
+        sfm_brcb,
+        m_stats[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
+        TILE_Q_UB // 8,
+        1,
+        8,
     )
     T.pipe_barrier("v")
     for sub_chunk in T.unroll(TILE_KV_L2 // ROW_EXPAND_VECTOR_ELEMS):
@@ -197,7 +227,8 @@ def softmax_composed_update(r):
     T.reduce_sum(
         score_local,
         l_panel[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
-        dim=-1, tmp=sfm_tmp,
+        dim=-1,
+        tmp=sfm_tmp,
     )
     # Probability casting only reads score_local too. The next strip's entry
     # barrier protects score/scratch reuse; Phase 2B orders the l_panel consumer.
@@ -208,11 +239,11 @@ def finish_softmax_stats(stage, q_ring):
     T.tile.brcb_experiment(scale_ring[stage, :, :], m_prev, HALF_Q // 8, 1, 8)
     T.tile.brcb_experiment(sum_brcb, l_panel, HALF_Q // 8, 1, 8)
     T.pipe_barrier("v")
-    T.tile.mul(l_stats_ring[q_ring, :, :], l_stats_ring[q_ring, :, :],
-               scale_ring[stage, :, :])
+    T.tile.mul(l_stats_ring[q_ring, :, :], l_stats_ring[q_ring, :, :], scale_ring[stage, :, :])
     T.pipe_barrier("v")
     T.tile.add(l_stats_ring[q_ring, :, :], l_stats_ring[q_ring, :, :], sum_brcb)
     T.pipe_barrier("v")
+
 
 # ---------------------------------------------------------------------------
 # vec_softmax: TASK 2 — S → P + stats + early release
@@ -231,7 +262,7 @@ def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_sc
     q_ring = global_q % num_q_stages
 
     if kv_idx == 0:
-        T.tile.fill(m_stats, -(2 ** 30))
+        T.tile.fill(m_stats, -(2**30))
         T.tile.fill(l_stats_ring[q_ring, :, :], 0.0)
         T.pipe_barrier("v")
 
@@ -355,13 +386,15 @@ def vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages):
         if kv_idx != num_kv_blocks - 1:
             T.copy(st_o_acc, ws_oa[cid, row : row + TILE_Q_ACC, :])
         T.set_flag("MTE3", "V", 1)
+
+
 # ===========================================================================
+
 
 # ===========================================================================
 # Main kernel
 # ===========================================================================
-@tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6], pass_configs=pass_configs,
-              compile_flags=["--cce-auto-sync=off", "-O3"])
+@tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6], pass_configs=pass_configs, compile_flags=["--cce-auto-sync=off", "-O3"])
 def flash_attention_fwd(
     batch,
     seq_len,
@@ -417,12 +450,12 @@ def flash_attention_fwd(
             O_bh = T.decl_buffer([num_bh, q_seq, dim], dtype, data=Output.data, scope="global")
 
             # --- L1 buffers (Cube data path) ---
-            a_l1  = T.alloc_L1([2, TILE_M, TILE_K], dtype)
+            a_l1 = T.alloc_L1([2, TILE_M, TILE_K], dtype)
             kv_l1 = T.alloc_L1([N_ITERS, TILE_K, DIM], dtype)
 
             T.annotate_layout(
                 {
-                    a_l1:  make_zn_layout(a_l1),
+                    a_l1: make_zn_layout(a_l1),
                     kv_l1: make_nz_layout(kv_l1),
                 }
             )
@@ -443,40 +476,45 @@ def flash_attention_fwd(
             # [144K,~160K) auto  — stats + composed softmax temporaries
 
             # --- Work [0K, 32K) — V-pipe only, no Lock ---
-            score_local = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], accum_dtype)   # 32KB
+            score_local = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], accum_dtype)  # 32KB
 
             # --- Store [32K, 80K) — ST_ON + ST_BUF Lock ---
-            st_o_norm   = T.alloc_ub([TILE_Q_ACC, DIM], dtype)               # 16KB
-            st_prob     = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)         # 16KB
-            st_o_acc    = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)          # 32KB (alias st_prob)
+            st_o_norm = T.alloc_ub([TILE_Q_ACC, DIM], dtype)  # 16KB
+            st_prob = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)  # 16KB
+            st_o_acc = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)  # 32KB (alias st_prob)
 
             # --- Load [80K, 144K) — LD_BUF Lock ---
-            ld_score    = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)         # 16KB
-            ld_o_acc    = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)          # 32KB (alias ld_score)
-            ld_o_partial = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)         # 32KB
+            ld_score = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)  # 16KB
+            ld_o_acc = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)  # 32KB (alias ld_score)
+            ld_o_partial = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)  # 32KB
 
             row_expand_scalars = T.alloc_ub([TILE_Q_ACC, ELEM_PER_BLK], accum_dtype)
-            T.annotate_address({
-                # work [0K, 32K)
-                score_local: 0, row_expand_scalars: 0,
-                # store [32K, 80K)
-                st_o_norm: 32768,
-                st_prob: 49152, st_o_acc: 49152,
-                # load [80K, 144K)
-                ld_score: 81920, ld_o_acc: 81920,
-                ld_o_partial: 114688,
-            })
+            T.annotate_address(
+                {
+                    # work [0K, 32K)
+                    score_local: 0,
+                    row_expand_scalars: 0,
+                    # store [32K, 80K)
+                    st_o_norm: 32768,
+                    st_prob: 49152,
+                    st_o_acc: 49152,
+                    # load [80K, 144K)
+                    ld_score: 81920,
+                    ld_o_acc: 81920,
+                    ld_o_partial: 114688,
+                }
+            )
 
             # --- Auto [144K, ~158K) — stats + composed softmax workspace ---
             # Compact statistics are expanded only for row-wise consumers.
-            m_stats      = T.alloc_ub([HALF_Q, 1], accum_dtype)
-            m_prev       = T.alloc_ub([HALF_Q, 1], accum_dtype)
-            l_panel      = T.alloc_ub([HALF_Q, 1], accum_dtype)
-            sfm_brcb     = T.alloc_ub([TILE_Q_UB, ELEM_PER_BLK], accum_dtype)
-            sum_brcb     = T.alloc_ub([HALF_Q, ELEM_PER_BLK], accum_dtype)
+            m_stats = T.alloc_ub([HALF_Q, 1], accum_dtype)
+            m_prev = T.alloc_ub([HALF_Q, 1], accum_dtype)
+            l_panel = T.alloc_ub([HALF_Q, 1], accum_dtype)
+            sfm_brcb = T.alloc_ub([TILE_Q_UB, ELEM_PER_BLK], accum_dtype)
+            sum_brcb = T.alloc_ub([HALF_Q, ELEM_PER_BLK], accum_dtype)
             l_stats_ring = T.alloc_ub([num_q_stages, HALF_Q, ELEM_PER_BLK], accum_dtype)
-            scale_ring   = T.alloc_ub([NUM_STAGES, HALF_Q, ELEM_PER_BLK], accum_dtype)
-            sfm_tmp      = T.alloc_ub([SFM_WORKSPACE_BYTES], "uint8")
+            scale_ring = T.alloc_ub([NUM_STAGES, HALF_Q, ELEM_PER_BLK], accum_dtype)
+            sfm_tmp = T.alloc_ub([SFM_WORKSPACE_BYTES], "uint8")
 
             my_start = cid * q_tasks_per_core + T.if_then_else(cid < r_tasks, cid, r_tasks)
             my_count = q_tasks_per_core + T.if_then_else(cid < r_tasks, 1, 0)
@@ -503,10 +541,20 @@ def flash_attention_fwd(
                         bh_a = (my_start + old_step // num_kv_blocks) // num_q_blocks
                         kv_off_a = (old_step % num_kv_blocks) * TILE_KV_L2
                         gemm_contraction_split(
-                            ws_sp, cid, stage,
-                            V_bh, bh_a, kv_off_a,
-                            ws_op, cid, stage,
-                            a_l1, kv_l1, l0a, l0b, l0c,
+                            ws_sp,
+                            cid,
+                            stage,
+                            V_bh,
+                            bh_a,
+                            kv_off_a,
+                            ws_op,
+                            cid,
+                            stage,
+                            a_l1,
+                            kv_l1,
+                            l0a,
+                            l0b,
+                            l0c,
                         )
 
                     if step < my_total_steps:
@@ -515,10 +563,20 @@ def flash_attention_fwd(
                         q_off = (global_q % num_q_blocks) * TILE_Q_L2
                         kv_off_b = (step % num_kv_blocks) * TILE_KV_L2
                         gemm_output_split(
-                            Q_bh, bh_b, q_off,
-                            K_bh, bh_b, kv_off_b,
-                            ws_sp, cid, stage,
-                            a_l1, kv_l1, l0a, l0b, l0c,
+                            Q_bh,
+                            bh_b,
+                            q_off,
+                            K_bh,
+                            bh_b,
+                            kv_off_b,
+                            ws_sp,
+                            cid,
+                            stage,
+                            a_l1,
+                            kv_l1,
+                            l0a,
+                            l0b,
+                            l0c,
                         )
 
                     T.set_cross_flag("FIX", SEM_VEC)
