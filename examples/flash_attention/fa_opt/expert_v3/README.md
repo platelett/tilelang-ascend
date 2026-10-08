@@ -128,8 +128,8 @@ python examples/flash_attention/fa_opt/expert_v3/kernel.py
 修改后从仓库根目录执行：
 
 ```bash
-python examples/flash_attention/fa_opt/expert_v3/tools/preprocess.py \\
-  examples/flash_attention/fa_opt/expert_v3/kernel.tl \\
+python examples/flash_attention/fa_opt/expert_v3/tools/preprocess.py \
+  examples/flash_attention/fa_opt/expert_v3/kernel.tl \
   -o examples/flash_attention/fa_opt/expert_v3/kernel.py
 ruff format examples/flash_attention/fa_opt/expert_v3/kernel.py
 ```
