@@ -1,6 +1,6 @@
 # Expert v2：把私有短序列接进共享前缀流水
 
-本目录是新增的 v2 实现，不替换已有的 `xattention.py` 或 `xattention_paged.py`。
+本目录是新增的 v2 实现，不替换已有的 [非分页](../expert_v1/kernel.py)或[分页](../expert_v1/paged.py) v1。
 与它们的区别见[目录说明](../README.md)。
 
 [`kernel.py`](kernel.py) 计算这样一种 attention：同一请求下的多个候选序列（beam）

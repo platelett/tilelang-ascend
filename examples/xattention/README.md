@@ -1,14 +1,15 @@
 # xAttention 示例
 
-这里保留已有实现，并新增独立的 **Expert v2**。它们都计算共享前缀与每个 beam 私有
+这里按版本组织已有的 **Expert v1** 和新增的 **Expert v2**。它们都计算共享前缀与每个 beam 私有
 序列上的完整 attention，但计算组织和输入接口不同；v2 不是原接口的直接替换，
 也不表示已经证明它在当前主线上普遍更快。
 
 ```text
 xattention/
   README.md
-  xattention.py
-  xattention_paged.py
+  expert_v1/
+    kernel.py
+    paged.py
   expert_v2/
     kernel.py
     README.md
@@ -17,14 +18,16 @@ xattention/
 
 ## 入口
 
-- [`xattention.py`](xattention.py)：已有的非分页示例。
-- [`xattention_paged.py`](xattention_paged.py)：已有的分页示例，通过块表寻址 K/V。
+- [`expert_v1/kernel.py`](expert_v1/kernel.py)：已有的非分页示例。
+- [`expert_v1/paged.py`](expert_v1/paged.py)：已有的分页示例，通过块表寻址 K/V。
 - [`expert_v2/kernel.py`](expert_v2/kernel.py)：新增的连续 K/V 输入版本；中文优化历程和
   历史对照数据与代码放在同一目录，见 [Expert v2 说明](expert_v2/README.md)。
 
-## v2 与已有实现的区别
+v1 的两个脚本只移动路径，内容保持不变。旧路径不再保留一份重复入口。
 
-| 项目 | 已有两个示例 | Expert v2 |
+## v2 与 v1 的区别
+
+| 项目 | Expert v1 | Expert v2 |
 |---|---|---|
 | 共享/私有计算 | 分配不同的 Cube 核组，分别计算两部分 | 参与核处理共享前缀，两个私有 token 用 Vector 计算 |
 | 最终合并 | 两部分输出与统计量写到全局内存，全局同步后再合并 | 在最后一个共享 key 块的输出更新中直接合并，复用片上数据 |

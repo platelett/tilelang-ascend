@@ -218,8 +218,8 @@ mappings:
   examples/unsorted_segment_sum/unsorted_segment_sum.py: examples/unsorted_segment_sum/test_unsorted_segment_sum.py
 
   # examples/xattention
-  examples/xattention/xattention.py: examples/xattention/test_xattention.py
-  examples/xattention/xattention_paged.py: examples/xattention/test_xattention_paged.py
+  examples/xattention/expert_v1/kernel.py: examples/xattention/test_xattention.py
+  examples/xattention/expert_v1/paged.py: examples/xattention/test_xattention_paged.py
 
   # examples/xllm_kernels
   examples/xllm_kernels/fused_gdn_gating.py: examples/xllm_kernels/test_fused_gdn_gating.py
