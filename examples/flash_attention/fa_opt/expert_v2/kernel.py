@@ -194,7 +194,7 @@ O_ACC_STRIPS = HALF_Q // TILE_Q_ACC  # 2
 # Phase 2B: scale_ring for O_acc rescaling — no DMA
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
-def softmax_composed_update(r):
+def softmax_composed_update(r, score_local, m_stats, l_panel, sfm_brcb, sfm_tmp):
     # Scaled scores -> reduce -> BRCB -> independent Sub batch -> Exp -> sum.
     # Explicit boundaries also protect reuse of the shared reduction arena.
     T.pipe_barrier("v")
@@ -235,7 +235,7 @@ def softmax_composed_update(r):
 
 
 @T.macro(hygienic=False)
-def finish_softmax_stats(stage, q_ring):
+def finish_softmax_stats(stage, q_ring, scale_ring, m_prev, sum_brcb, l_panel, l_stats_ring):
     T.tile.brcb_experiment(scale_ring[stage, :, :], m_prev, HALF_Q // 8, 1, 8)
     T.tile.brcb_experiment(sum_brcb, l_panel, HALF_Q // 8, 1, 8)
     T.pipe_barrier("v")
@@ -254,7 +254,27 @@ def finish_softmax_stats(stage, q_ring):
 # Phase 2B: scale banks for O_acc rescaling — no DMA
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
-def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_scale):
+def vec_softmax(
+    step,
+    my_start,
+    num_kv_blocks,
+    num_q_stages,
+    sm_scale,
+    cid,
+    vid,
+    ws_sp,
+    ld_score,
+    score_local,
+    st_prob,
+    m_stats,
+    m_prev,
+    l_panel,
+    sfm_brcb,
+    sum_brcb,
+    l_stats_ring,
+    scale_ring,
+    sfm_tmp,
+):
     stage = step % NUM_STAGES
     q_task = step // num_kv_blocks
     global_q = my_start + q_task
@@ -289,7 +309,7 @@ def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_sc
         # Pre-scale scores for online softmax
         T.tile.mul(score_local, score_local, sm_scale)
 
-        softmax_composed_update(r)
+        softmax_composed_update(r, score_local, m_stats, l_panel, sfm_brcb, sfm_tmp)
 
         # V → MTE3: store P strip
         T.wait_flag("MTE3", "V", 1)
@@ -307,11 +327,29 @@ def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_sc
     T.pipe_barrier("v")
     T.tile.exp(m_prev, m_prev)
     T.pipe_barrier("v")
-    finish_softmax_stats(stage, q_ring)
+    finish_softmax_stats(stage, q_ring, scale_ring, m_prev, sum_brcb, l_panel, l_stats_ring)
 
 
 @T.macro(hygienic=False)
-def vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages):
+def vec_o_acc(
+    step,
+    my_start,
+    num_q_blocks,
+    num_kv_blocks,
+    num_q_stages,
+    cid,
+    vid,
+    ws_op,
+    ws_oa,
+    O_bh,
+    ld_o_partial,
+    ld_o_acc,
+    st_o_acc,
+    st_o_norm,
+    row_expand_scalars,
+    scale_ring,
+    l_stats_ring,
+):
     old_step = step - NUM_STAGES
     stage = step % NUM_STAGES
     old_q_task = old_step // num_kv_blocks
@@ -425,7 +463,6 @@ def flash_attention_fwd(
     num_q_blocks = q_seq // TILE_Q_L2
     num_kv_blocks = kv_seq // TILE_KV_L2
     global_q_tasks = num_bh * num_q_blocks
-    total_tasks = global_q_tasks * num_kv_blocks
 
     num_q_stages = 1 + (NUM_STAGES + num_kv_blocks - 1) // num_kv_blocks
 
@@ -605,11 +642,49 @@ def flash_attention_fwd(
 
                     if step >= NUM_STAGES:
                         T.wait_flag("MTE3", "MTE2", 3)
-                        vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages)
+                        vec_o_acc(
+                            step,
+                            my_start,
+                            num_q_blocks,
+                            num_kv_blocks,
+                            num_q_stages,
+                            cid,
+                            vid,
+                            ws_op,
+                            ws_oa,
+                            O_bh,
+                            ld_o_partial,
+                            ld_o_acc,
+                            st_o_acc,
+                            st_o_norm,
+                            row_expand_scalars,
+                            scale_ring,
+                            l_stats_ring,
+                        )
                         T.set_flag("MTE3", "MTE2", 3)
 
                     if step < my_total_steps:
-                        vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_scale)
+                        vec_softmax(
+                            step,
+                            my_start,
+                            num_kv_blocks,
+                            num_q_stages,
+                            sm_scale,
+                            cid,
+                            vid,
+                            ws_sp,
+                            ld_score,
+                            score_local,
+                            st_prob,
+                            m_stats,
+                            m_prev,
+                            l_panel,
+                            sfm_brcb,
+                            sum_brcb,
+                            l_stats_ring,
+                            scale_ring,
+                            sfm_tmp,
+                        )
 
                 T.wait_flag("V", "MTE2", 0)
                 T.wait_flag("MTE3", "V", 1)
