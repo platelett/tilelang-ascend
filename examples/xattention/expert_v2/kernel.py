@@ -1,4 +1,4 @@
-"""BF16 decode attention with a shared prefix and two per-beam tokens.
+"""Expert v2: BF16 decode attention with a shared prefix and two per-beam tokens.
 
 Adapted from xa's tl_xattn_v3q. See README.md for the algorithm and input shapes.
 """

@@ -1,4 +1,7 @@
-# 共享前缀 Decode Attention：把短尾巴接进长流水
+# Expert v2：把私有短序列接进共享前缀流水
+
+本目录是新增的 v2 实现，不替换已有的 `xattention.py` 或 `xattention_paged.py`。
+与它们的区别见[目录说明](../README.md)。
 
 [`kernel.py`](kernel.py) 计算这样一种 attention：同一请求下的多个候选序列（beam）
 共享一段较长的历史 K/V，但每个 beam 还有自己的两个新 token。每个 query 都要对
@@ -124,9 +127,9 @@ softmax 与输出累加使用 FP32；32 个 query 头共享 8 个 K/V 头，头�
 
 ```bash
 source ./set_env.sh
-python examples/xattention/decode/kernel.py
+python examples/xattention/expert_v2/kernel.py
 # 原研究问题的 18 个输入形状，仅检查本示例，不运行全量算子测试：
-python examples/xattention/decode/kernel.py --all-cases
+python examples/xattention/expert_v2/kernel.py --all-cases
 ```
 
 默认检查两个输入，覆盖单 key 块与多 key 块处理；参考实现对拼接后的完整序列计算
