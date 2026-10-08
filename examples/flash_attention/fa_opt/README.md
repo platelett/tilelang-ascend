@@ -9,10 +9,12 @@
 |---|---|---|
 | Expert v1 | [`expert_v1/kernel.py`](expert_v1/kernel.py) | 原有手工同步 Expert 实现；历史成绩见 benchmark 文档 |
 | Expert v2 | [`expert_v2/kernel.py`](expert_v2/kernel.py) | 三槽在线 softmax Expert 实现；[优化历程](expert_v2/README.md) 与源码同目录 |
+| Expert v3 | [`expert_v3/kernel.py`](expert_v3/kernel.py) | 从已验证的 CCE 调度出发，用 TileLang 表达；FP32 输出累加常驻 UB；[优化历程](expert_v3/README.md) 与源码同目录 |
 | Auto pipeline | [`auto_pipeline/`](auto_pipeline/) | H16/D128 与 H32/D512 两个自动流水版本 |
 | AscendC reference | [`reference/ascendc.py`](reference/ascendc.py) | 性能对比使用的原生算子入口 |
 
-Expert v2 是新增的实现谱系，不在没有同环境 A/B 的情况下覆盖 v1 的历史性能结论。
+v2 从 TileLang 的写法出发组织高性能流水；v3 先用 CCE 验证计算和调度，再用 TileLang
+表达，具体接口取舍放在 v3 文档中。两条路线并存，不覆盖 v1 的历史实现。
 
 ## 运行
 
@@ -38,3 +40,4 @@ bash examples/flash_attention/fa_opt/bench.sh
 - [历史 benchmark](docs/benchmark_zh.md)
 - [通用性能优化指南](docs/optimization_guide_zh.md)
 - [Expert v2 优化历程](expert_v2/README.md)
+- [Expert v3 优化历程与 TileLang 表达取舍](expert_v3/README.md)
